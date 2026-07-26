@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
@@ -33,6 +33,12 @@ from PySide6.QtWidgets import (
 )
 
 from app.workers.background import Worker
+
+
+#: Threads still running, kept alive here rather than being parented to the
+#: tool page. A tool page is deleted as soon as the user navigates away, and
+#: destroying a QThread that is still running aborts the process.
+_LIVE_THREADS: set = set()
 
 
 class Section(QFrame):
@@ -68,6 +74,11 @@ class BaseTool(QWidget):
 
     title: str = "Tool"
     subtitle: str = ""
+
+    #: Emitted from the worker thread; delivered on the GUI thread, which is
+    #: the only thread allowed to touch the progress bar.
+    progress_changed = Signal(int, int)
+    log_changed = Signal(str)
 
     def __init__(self, main_window, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -153,6 +164,29 @@ class BaseTool(QWidget):
         alayout.addLayout(row)
 
         wrap.addWidget(actions_w)
+        #: Kept so the success banner lands in the right place; deriving it
+        #: from the button's ancestry picked the wrong widget.
+        self._actions_layout = alayout
+
+        self.progress_changed.connect(self._apply_progress)
+        self.log_changed.connect(self._apply_log)
+
+    # -- progress plumbing (always executed on the GUI thread) -------------
+
+    def _apply_progress(self, value: int, total: int) -> None:
+        if total > 0:
+            self.progress.setRange(0, total)
+            self.progress.setValue(value)
+        else:
+            self.progress.setRange(0, 0)
+
+    def _apply_log(self, message: str) -> None:
+        self.progress.setFormat(message or "Working…")
+
+    def is_busy(self) -> bool:
+        """True while a background job is still running."""
+        thread = self._thread
+        return thread is not None and thread.isRunning()
 
     # -- subclass hooks ---------------------------------------------------
 
@@ -200,6 +234,10 @@ class BaseTool(QWidget):
 
     def _set_processing(self, processing: bool) -> None:
         self.run_btn.setEnabled(not processing)
+        # Tool ``run()`` bodies read their options straight off the widgets
+        # from the worker thread, so the options must not change underneath
+        # them while a job is in flight.
+        self._sections_host.setEnabled(not processing)
         self.run_btn.setProperty("processing", processing)
         self.run_btn.style().unpolish(self.run_btn)
         self.run_btn.style().polish(self.run_btn)
@@ -227,14 +265,10 @@ class BaseTool(QWidget):
         # the user's ``run(log, progress, is_cancelled)`` so we don't
         # fight with the Worker's own args/kwargs.
         def _progress(value: int, total: int) -> None:
-            if total > 0:
-                self.progress.setRange(0, total)
-                self.progress.setValue(value)
-            else:
-                self.progress.setRange(0, 0)
+            self.progress_changed.emit(value, total)
 
         def _log(msg: str) -> None:
-            self.progress.setFormat(msg or "Working…")
+            self.log_changed.emit(msg)
 
         cancelled = {"v": False}
 
@@ -248,8 +282,12 @@ class BaseTool(QWidget):
         worker = Worker(runner)
         self._worker = worker
 
-        thread = QThread(self)
+        # Deliberately unparented: parenting the thread to this page means
+        # navigating away destroys a running QThread, which aborts the
+        # process. _LIVE_THREADS keeps it alive until it finishes on its own.
+        thread = QThread()
         self._thread = thread
+        _LIVE_THREADS.add(thread)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_run_done)
@@ -260,6 +298,7 @@ class BaseTool(QWidget):
         worker.cancelled.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: _LIVE_THREADS.discard(thread))
         thread.start()
 
     def _on_run_done(self, result: Any) -> None:
@@ -324,18 +363,8 @@ class BaseTool(QWidget):
         another_btn.clicked.connect(self._reset_for_another)
         layout.addWidget(another_btn)
 
-        # Insert just above the action row
-        host = self._sections_host.parent()
-        # easier: insert into the outer vertical layout, just before the
-        # trailing stretch
-        outer = self.layout()
-        # Outer has: [scroll, then actions_w].  Actually actions_w is inside
-        # the scroll, not at the outer level. Insert into the actions_w
-        # vertical layout at index 0.
-        actions_w = self.run_btn.parentWidget().parentWidget()
-        # actions_w is the wrapper; its layout is alayout from __init__
-        actions_layout = actions_w.layout()
-        actions_layout.insertWidget(0, banner)
+        # Insert at the top of the action row, just above the progress bar.
+        self._actions_layout.insertWidget(0, banner)
         self._success_banner = banner
 
     def _open_output(self, path: str) -> None:
@@ -361,6 +390,4 @@ class BaseTool(QWidget):
         self._last_outputs = []
 
 
-# Re-exports for backward compat
-from .base import BaseTool as _BaseTool  # noqa: E402
 FilePicker = None  # legacy

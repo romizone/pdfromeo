@@ -146,12 +146,16 @@ class SplitTool(BaseTool):
             pattern = str(out_dir / f"{Path(src).stem}_part_{{n}}.pdf")
         if text.lower() == "all":
             return PdfEngine.split_each_page(src, out_dir)
+        last_page = PdfEngine.open(src).page_count
         ranges = []
         for tok in text.split():
             if "-" in tok:
                 a, b = tok.split("-", 1)
                 a = int(a) if a else 1
-                b = int(b) if b else a
+                # An open-ended range means "through the end of the
+                # document"; treating it as a single page turned the
+                # default "1-" into a one-page extract.
+                b = int(b) if b else last_page
             else:
                 a = b = int(tok)
             ranges.append((a, b))
@@ -166,14 +170,14 @@ class SplitByBookmarksTool(BaseTool):
         self.src = DropZone(title="Drop a PDF here", kind="pdf")
         sec = self.add_section("Source")
         sec.add_widget(self.src)
-        self.out = OutputPicker(file_filter="PDF (*.pdf)")
+        self.out = OutputPicker(label="Save to folder:", mode="dir")
         sec2 = self.add_section("Output folder")
         sec2.add_widget(self.out)
 
     def run(self, log, progress, is_cancelled) -> Any:
         if not self.src.first_file():
             raise EngineError("Pick a source PDF.")
-        out = self.out.path() or str(Path(self.src.first_file()).parent)
+        out = self.out.directory(Path(self.src.first_file()).parent)
         return PdfEngine.split_by_bookmarks(self.src.first_file(), out)
 
 
@@ -185,14 +189,14 @@ class SplitInHalfTool(BaseTool):
         self.src = DropZone(title="Drop a scanned PDF here", kind="pdf")
         sec = self.add_section("Source")
         sec.add_widget(self.src)
-        self.out = OutputPicker(file_filter="PDF (*.pdf)")
+        self.out = OutputPicker(label="Save to folder:", mode="dir")
         sec2 = self.add_section("Output folder")
         sec2.add_widget(self.out)
 
     def run(self, log, progress, is_cancelled) -> Any:
         if not self.src.first_file():
             raise EngineError("Pick a source PDF.")
-        out = self.out.path() or str(Path(self.src.first_file()).parent)
+        out = self.out.directory(Path(self.src.first_file()).parent)
         out_dir = Path(out)
         out_dir.mkdir(parents=True, exist_ok=True)
         pattern = str(out_dir / f"{Path(self.src.first_file()).stem}_{{n}}_{{side}}.pdf")
@@ -213,14 +217,14 @@ class SplitBySizeTool(BaseTool):
         self.size.setSuffix(" MB")
         sec2 = self.add_section("Max chunk size")
         sec2.add_widget(self.size)
-        self.out = OutputPicker(file_filter="PDF (*.pdf)")
+        self.out = OutputPicker(label="Save to folder:", mode="dir")
         sec3 = self.add_section("Output folder")
         sec3.add_widget(self.out)
 
     def run(self, log, progress, is_cancelled) -> Any:
         if not self.src.first_file():
             raise EngineError("Pick a source PDF.")
-        out = self.out.path() or str(Path(self.src.first_file()).parent)
+        out = self.out.directory(Path(self.src.first_file()).parent)
         return PdfEngine.split_by_size(
             self.src.first_file(), float(self.size.value()), out
         )
@@ -238,14 +242,14 @@ class SplitByTextTool(BaseTool):
         self.marker.setPlaceholderText("e.g. INVOICE")
         sec2 = self.add_section("Marker text")
         sec2.add_widget(self.marker)
-        self.out = OutputPicker(file_filter="PDF (*.pdf)")
+        self.out = OutputPicker(label="Save to folder:", mode="dir")
         sec3 = self.add_section("Output folder")
         sec3.add_widget(self.out)
 
     def run(self, log, progress, is_cancelled) -> Any:
         if not self.src.first_file() or not self.marker.text().strip():
             raise EngineError("Provide a source PDF and marker text.")
-        out = self.out.path() or str(Path(self.src.first_file()).parent)
+        out = self.out.directory(Path(self.src.first_file()).parent)
         return PdfEngine.split_by_text(
             self.src.first_file(), self.marker.text(), out
         )
@@ -268,15 +272,30 @@ class ExtractPagesTool(BaseTool):
         sec3.add_widget(self.out)
 
     @staticmethod
-    def _parse(text: str) -> list[int]:
+    def _parse(text: str, keep_order: bool = False) -> list[int]:
+        """Parse a page list such as ``3,1,2`` or ``1-4 7``.
+
+        ``keep_order`` preserves the order the user typed, which is the
+        whole point for Organize Pages — sorting it there silently turned
+        every reordering into a no-op.
+        """
         out = []
         for tok in text.replace(",", " ").split():
             if "-" in tok:
                 a, b = tok.split("-", 1)
                 a = int(a); b = int(b)
-                out.extend(range(a, b + 1))
+                step = 1 if b >= a else -1
+                out.extend(range(a, b + step, step))
             else:
                 out.append(int(tok))
+        if keep_order:
+            seen = set()
+            ordered = []
+            for n in out:
+                if n not in seen:
+                    seen.add(n)
+                    ordered.append(n)
+            return ordered
         return sorted(set(out))
 
     def run(self, log, progress, is_cancelled) -> Any:
@@ -338,7 +357,7 @@ class OrganizeTool(BaseTool):
             raise EngineError("Provide a source PDF and new order.")
         if not self.out.path():
             raise EngineError("Pick an output file.")
-        order = ExtractPagesTool._parse(self.order.text())
+        order = ExtractPagesTool._parse(self.order.text(), keep_order=True)
         return PdfEngine.organize(self.src.first_file(), order, self.out.path())
 
 

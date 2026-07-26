@@ -16,8 +16,12 @@ from PySide6.QtWidgets import (
 
 from app.engine import EngineError, PdfEngine
 
+from app import __version__
+
 from .home import HomeView
-from .tool_registry import TOOL_NEEDS_DOC, tool_available, missing_dep_message
+from .tool_registry import (
+    TOOL_NEEDS_DOC, missing_dep_message, refresh_dependencies, tool_available,
+)
 
 
 # Recent files: persist last 5 in ~/Library/Application Support/PdfRomeo/
@@ -260,13 +264,33 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ Actions
 
+    def _tool_is_busy(self) -> bool:
+        """True if the open tool has a background job still running."""
+        widget = self._current_tool_widget
+        return bool(widget is not None and getattr(widget, "is_busy", bool)())
+
+    def _confirm_leave_running_tool(self) -> bool:
+        if not self._tool_is_busy():
+            return True
+        return QMessageBox.question(
+            self, "PdfRomeo",
+            "This tool is still working. Leave anyway and abandon the job?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
+
     def go_home(self) -> None:
         """Show the tool grid homepage."""
+        if not self._confirm_leave_running_tool():
+            return
         if self._current_tool_widget is not None:
             self.stack.removeWidget(self._current_tool_widget)
             self._current_tool_widget.deleteLater()
             self._current_tool_widget = None
         self._current_tool_id = None
+        # A dependency may have been installed while the app was open.
+        refresh_dependencies()
+        self.home.set_current_path(self._current_path)
         self.stack.setCurrentWidget(self.home)
         self.all_btn.setVisible(False)
         self.tool_name.setVisible(False)
@@ -305,6 +329,8 @@ class MainWindow(QMainWindow):
         Resets every piece of UI state that references the old path so the
         user can't accidentally run a tool against a stale file.
         """
+        if not self._confirm_leave_running_tool():
+            return
         self._current_path = None
         # If a tool is active, rebuild it so its DropZone clears.
         if self._current_tool_widget is not None and self._current_tool_id:
@@ -312,18 +338,22 @@ class MainWindow(QMainWindow):
             self.go_home()
             # Re-open the same tool with no source
             self._on_tool_selected(tool_id)
+        # Re-dim the cards that need an open document; without this the home
+        # page kept showing every tool as usable after ⌘W.
+        self.home.set_current_path(None)
         self._update_page_info()
         self._status.setText("Closed — open another PDF or pick a tool")
 
     def _action_about(self) -> None:
+        from .styles import TEXT_MUTED
         QMessageBox.about(
             self, "About PdfRomeo",
-            "<h3>PdfRomeo 1.0</h3>"
+            f"<h3>PdfRomeo {__version__}</h3>"
             "<p>A professional, user-friendly PDF toolkit for macOS "
             "(Apple Silicon).</p>"
             "<p>Built with PySide6, pikepdf and PyMuPDF.</p>"
-            "<p style='color:#6b7280'>43 tools, all in one clean window. "
-            "Drag &amp; drop PDFs onto a tool to start.</p>"
+            f"<p style='color:{TEXT_MUTED}'>43 tools, all in one clean "
+            "window. Drag &amp; drop PDFs onto a tool to start.</p>"
         )
 
     # ---------------------------------------------------------- Document I/O
@@ -391,7 +421,11 @@ class MainWindow(QMainWindow):
             self._status.setText(f"Unknown tool: {tool_id}")
             return
 
-        # Block tools whose system dependencies are missing.
+        # Block tools whose system dependencies are missing. Re-detect
+        # first, so a dependency installed since launch is picked up.
+        if not tool_available(tool_id):
+            refresh_dependencies()
+            self.home.set_current_path(self._current_path)
         if not tool_available(tool_id):
             QMessageBox.warning(
                 self, "Tool unavailable",
@@ -421,6 +455,9 @@ class MainWindow(QMainWindow):
                 pass
 
         if self._current_tool_widget is not None:
+            if not self._confirm_leave_running_tool():
+                widget.deleteLater()
+                return
             self.stack.removeWidget(self._current_tool_widget)
             self._current_tool_widget.deleteLater()
         self.stack.addWidget(widget)

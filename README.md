@@ -125,13 +125,19 @@ xcrun stapler staple dist/PdfRomeo.dmg
 
 ## 🧩 System dependencies
 
-| Feature | System binary | Install |
+| Feature | Needs | Install |
 | --- | --- | --- |
-| OCR / Deskew | `tesseract` | `brew install tesseract` |
+| OCR / Deskew | `tesseract` + `pytesseract` | `brew install tesseract` |
 | HTML → PDF | `cairo`, `pango`, `gdk-pixbuf`, `libffi` | `brew install cairo pango gdk-pixbuf libffi` |
-| Word → PDF (macOS) | Pages | App Store |
+| Word → PDF | Apple Pages **or** WeasyPrint | App Store, or the row above |
 
-Without the OCR / HTML deps, the other 41 tools work normally.
+Tools whose dependencies are missing are dimmed on the home page, with a
+tooltip explaining what to install. Everything else works normally.
+
+Homebrew installs to `/opt/homebrew`, which macOS does not put on the
+search path of an app launched from Finder. PdfRomeo looks there itself,
+for both the Tesseract binary and the cairo/pango libraries, so a normal
+`brew install` is picked up without any extra shell configuration.
 
 ---
 

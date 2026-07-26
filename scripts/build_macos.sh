@@ -7,6 +7,7 @@
 # Requirements (run once):
 #     xcode-select --install
 #     brew install create-dmg
+#     brew install python@3.11
 #     python3.11 -m venv .venv && source .venv/bin/activate
 #     pip install -r requirements.txt
 #
@@ -32,7 +33,14 @@ if [[ "$(uname -m)" != "arm64" ]]; then
   echo "WARNING: Not running on Apple Silicon. Forcing arm64 build."
 fi
 
-PY="${PYTHON:-python3}"
+# Python 3.11 specifically: the Qt platform plugins shipped with PySide6
+# do not load under the Python 3.9 that comes with Xcode on Apple Silicon,
+# which leaves the built app unable to start.
+PY="${PYTHON:-python3.11}"
+if ! command -v "$PY" >/dev/null 2>&1; then
+  echo "ERROR: $PY not found. Install it with: brew install python@3.11" >&2
+  exit 1
+fi
 echo "Using Python: $($PY --version)"
 
 # 1) Virtualenv ------------------------------------------------------------
@@ -49,6 +57,7 @@ rm -rf build dist *.egg-info
 
 # 3) Build .app ------------------------------------------------------------
 echo "==> Building .app (this can take a few minutes)..."
+mkdir -p build
 python setup.py py2app 2>&1 | tee build/py2app.log
 echo "==> Built: dist/PdfRomeo.app"
 

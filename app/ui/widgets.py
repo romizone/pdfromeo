@@ -395,7 +395,14 @@ class DropZone(QFrame):
 # ---------------------------------------------------------------------------
 
 class OutputPicker(QFrame):
-    """A simple 'output folder / file' picker that mirrors Sejda's compact style."""
+    """A simple 'output folder / file' picker that mirrors Sejda's compact style.
+
+    ``mode`` is ``"save"`` (pick a destination file), ``"open"`` (pick an
+    existing file) or ``"dir"`` (pick a folder). Tools that produce several
+    files must use ``"dir"``: handing a *file* path to an engine function
+    that expects a directory makes it create a folder literally named
+    ``something.pdf``.
+    """
 
     def __init__(self, label: str = "Save to:",
                  mode: str = "save",
@@ -417,7 +424,9 @@ class OutputPicker(QFrame):
         row = QHBoxLayout()
         row.setSpacing(8)
         self.edit = QLineEdit()
-        self.edit.setPlaceholderText("No file selected")
+        self.edit.setPlaceholderText(
+            "No folder selected" if mode == "dir" else "No file selected"
+        )
         row.addWidget(self.edit, 1)
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._browse)
@@ -425,7 +434,11 @@ class OutputPicker(QFrame):
         layout.addLayout(row)
 
     def _browse(self) -> None:
-        if self._mode == "open":
+        if self._mode == "dir":
+            p = QFileDialog.getExistingDirectory(
+                self, "Select output folder", str(Path.home())
+            )
+        elif self._mode == "open":
             p, _ = QFileDialog.getOpenFileName(
                 self, "Select file", str(Path.home()), self._filter
             )
@@ -439,6 +452,22 @@ class OutputPicker(QFrame):
 
     def path(self) -> str:
         return self.edit.text().strip()
+
+    def directory(self, fallback: str | os.PathLike) -> str:
+        """Return a usable output *directory*.
+
+        Accepts what the user actually typed: a folder, a file path (whose
+        parent is used), or nothing at all (``fallback`` is used).
+        """
+        text = self.path()
+        if not text:
+            return str(fallback)
+        candidate = Path(text).expanduser()
+        if candidate.is_dir():
+            return str(candidate)
+        if candidate.suffix:
+            return str(candidate.parent)
+        return str(candidate)
 
     def set_path(self, p: str) -> None:
         self.edit.setText(p)

@@ -258,6 +258,108 @@ class PdfEngine:
         return outputs
 
     @staticmethod
+    def _page_index_map(pdf: Pdf) -> dict:
+        """Map each page's object id to its zero-based index."""
+        mapping = {}
+        for i, page in enumerate(pdf.pages):
+            try:
+                mapping[page.obj.objgen] = i
+            except Exception:
+                continue
+        return mapping
+
+    @staticmethod
+    def _outline_page_index(pdf: Pdf, entry, index_of: dict) -> int | None:
+        """Resolve the page an outline entry points at, or None.
+
+        A destination is either an array whose first element is the page
+        object, or a name that has to be looked up in the document's
+        ``/Dests`` tree. Entries may also carry a ``/GoTo`` action instead.
+        """
+        candidates = []
+        for attr in ("destination", "action"):
+            try:
+                value = getattr(entry, attr, None)
+            except Exception:
+                value = None
+            if value is not None:
+                candidates.append(value)
+        try:
+            obj = entry.obj
+            for key in ("/Dest", "/A"):
+                if key in obj:
+                    candidates.append(obj[key])
+        except Exception:
+            pass
+
+        for candidate in candidates:
+            dest = candidate
+            # A /GoTo action wraps the real destination under /D.
+            try:
+                if hasattr(dest, "get") and "/D" in dest:
+                    dest = dest["/D"]
+            except Exception:
+                pass
+            # A named destination needs resolving through the name tree.
+            if isinstance(dest, (str, bytes)) or getattr(dest, "_type_name", "") in ("string", "name"):
+                dest = PdfEngine._resolve_named_dest(pdf, dest)
+                if dest is None:
+                    continue
+            try:
+                target = dest[0]
+                idx = index_of.get(target.objgen)
+                if idx is not None:
+                    return idx
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _resolve_named_dest(pdf: Pdf, name):
+        """Look a named destination up in /Names/Dests or the legacy /Dests."""
+        key = str(name)
+        if key.startswith("/"):
+            key = key[1:]
+        try:
+            root = pdf.Root
+        except Exception:
+            return None
+        # Legacy dictionary form
+        try:
+            dests = root.get("/Dests")
+            if dests is not None:
+                for candidate in ("/" + key, key):
+                    if candidate in dests:
+                        value = dests[candidate]
+                        return value.get("/D", value) if hasattr(value, "get") else value
+        except Exception:
+            pass
+        # Name tree form
+        try:
+            tree = root["/Names"]["/Dests"]
+        except Exception:
+            return None
+
+        def walk(node):
+            try:
+                if "/Names" in node:
+                    names = node["/Names"]
+                    for i in range(0, len(names) - 1, 2):
+                        if str(names[i]) == key:
+                            value = names[i + 1]
+                            return value.get("/D", value) if hasattr(value, "get") else value
+                if "/Kids" in node:
+                    for kid in node["/Kids"]:
+                        found = walk(kid)
+                        if found is not None:
+                            return found
+            except Exception:
+                return None
+            return None
+
+        return walk(tree)
+
+    @staticmethod
     def split_by_bookmarks(src: str, dest_dir: str | os.PathLike) -> list[str]:
         """Split using top-level outline entries as chapter boundaries."""
         try:
@@ -272,14 +374,12 @@ class PdfEngine:
                 entries = list(outline.root)
             if not entries:
                 raise EngineError("No bookmarks/outline found in this PDF.")
+            index_of = PdfEngine._page_index_map(pdf)
             boundaries: list[int] = []
             for entry in entries:
-                try:
-                    loc = entry.destination
-                    page_idx = pdf.get_object_number(loc.page) - 1
+                page_idx = PdfEngine._outline_page_index(pdf, entry, index_of)
+                if page_idx is not None:
                     boundaries.append(page_idx)
-                except Exception:
-                    continue
             boundaries = sorted(set(boundaries))
             if not boundaries:
                 raise EngineError("Bookmarks found but no valid page targets.")
@@ -346,8 +446,10 @@ class PdfEngine:
                 size = os.path.getsize(tmp_path)
                 os.unlink(tmp_path)
                 if size > target_bytes and len(chunk.pages) > 1:
-                    # Roll back: pop the last page into its own chunk
-                    chunk.pages.remove(page)
+                    # Roll back by position: ``page`` belongs to the source
+                    # document, and pikepdf refuses to remove it from
+                    # ``chunk`` (which holds a copy, not the same object).
+                    del chunk.pages[-1]
                     dest = dest_dir / f"{stem}_part_{chunk_index:02d}.pdf"
                     PdfEngine._save(chunk, dest)
                     outputs.append(str(dest))
@@ -684,6 +786,36 @@ class PdfEngine:
             doc.save(str(dest or src), deflate=True, garbage=4)
 
     @staticmethod
+    def _watermark_stamp(image_path: str, opacity: float,
+                         rotation: int) -> str:
+        """Return a path to the image faded and rotated ready for stamping.
+
+        Falls back to the original path if Pillow is unavailable or the
+        image cannot be processed, so a watermark is still applied.
+        """
+        opacity = max(0.0, min(1.0, opacity))
+        if opacity >= 1.0 and rotation % 360 == 0:
+            return image_path
+        try:
+            from PIL import Image as _Im
+            img = _Im.open(image_path).convert("RGBA")
+            if opacity < 1.0:
+                alpha = img.getchannel("A").point(
+                    lambda v: int(v * opacity)
+                )
+                img.putalpha(alpha)
+            if rotation % 360:
+                img = img.rotate(rotation, expand=True,
+                                 resample=_Im.BICUBIC)
+            with tempfile.NamedTemporaryFile(suffix=".png",
+                                             delete=False) as tmp:
+                path = tmp.name
+            img.save(path, format="PNG")
+            return path
+        except Exception:
+            return image_path
+
+    @staticmethod
     def add_watermark(src: str, text: str | None, image_path: str | None,
                       opacity: float = 0.3, rotation: int = 45,
                       dest: str | os.PathLike | None = None) -> None:
@@ -695,34 +827,67 @@ class PdfEngine:
             for page in doc:
                 rect = page.rect
                 if image_path:
-                    page.insert_image(
-                        fitz.Rect(rect.x0, rect.y0,
-                                  rect.x1, rect.y1),
-                        filename=image_path,
-                        overlay=True,
-                        keep_proportion=True,
-                        rotate=rotation,
-                        opacity=opacity,
+                    # insert_image has no opacity parameter and its rotate
+                    # only accepts multiples of 90, so fading and rotating
+                    # are baked into the image before it is stamped.
+                    stamp = PdfEngine._watermark_stamp(
+                        image_path, opacity, rotation
                     )
+                    try:
+                        page.insert_image(
+                            fitz.Rect(rect.x0, rect.y0,
+                                      rect.x1, rect.y1),
+                            filename=stamp,
+                            overlay=True,
+                            keep_proportion=True,
+                        )
+                    finally:
+                        if stamp != image_path:
+                            try: os.unlink(stamp)
+                            except Exception: pass
                 else:
                     # For text watermarks, lower the color intensity instead of
                     # using opacity (insert_text has no opacity parameter).
                     gray = max(0.0, min(1.0, 1.0 - opacity))
-                    # Use a Shape for arbitrary rotation support
                     shape = page.new_shape()
-                    # rotate the textbox around its center
                     cx, cy = (rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2
-                    # Round to nearest 90 for insert_textbox
-                    rot90 = (round(rotation / 90) * 90) % 360
                     tb_w, tb_h = rect.width, rect.height
+                    # ``rotate`` only takes multiples of 90, so an angle like
+                    # the default 45° is applied with a morph matrix pivoting
+                    # on the page centre instead.
+                    angle = rotation % 360
+                    morph = None
+                    if angle % 90:
+                        morph = (fitz.Point(cx, cy), fitz.Matrix(angle))
+                        # Shrink the box so its rotated corners stay on the
+                        # page, otherwise the text is clipped.
+                        radians = math.radians(angle)
+                        spread = abs(math.cos(radians)) + abs(math.sin(radians))
+                        tb_w /= spread
+                        tb_h /= spread
+                        angle = 0
+                    box = fitz.Rect(cx - tb_w/2, cy - tb_h/2,
+                                    cx + tb_w/2, cy + tb_h/2)
+                    label = text or "WATERMARK"
+                    # Shrink the type until the label fits on one line;
+                    # otherwise a long word wraps mid-word across the page.
+                    fontsize = 72.0
+                    unit_width = fitz.get_text_length(
+                        label, fontname="helv", fontsize=1
+                    )
+                    if unit_width > 0:
+                        fontsize = min(
+                            fontsize, (box.width * 0.92) / unit_width
+                        )
+                    fontsize = max(8.0, fontsize)
                     shape.insert_textbox(
-                        fitz.Rect(cx - tb_w/2, cy - tb_h/2,
-                                  cx + tb_w/2, cy + tb_h/2),
-                        text or "WATERMARK",
-                        fontsize=72,
-                        rotate=rot90,
+                        box,
+                        label,
+                        fontsize=fontsize,
+                        rotate=angle,
                         color=(gray, gray, gray),
                         align=fitz.TEXT_ALIGN_CENTER,
+                        morph=morph,
                     )
                     shape.commit()
             doc.save(str(dest or src), deflate=True, garbage=4)
@@ -899,8 +1064,13 @@ class PdfEngine:
                     xref = img[0]
                     try:
                         pix = fitz.Pixmap(doc, xref)
-                        # CMYK → RGB
-                        if pix.n - pix.alpha >= 4:
+                        # Normalise to plain RGB. Grayscale (n=1) and
+                        # anything with an alpha channel have to be
+                        # converted too — reading their samples as RGB
+                        # raises, which silently skipped those images.
+                        if pix.alpha:
+                            pix = fitz.Pixmap(pix, 0)
+                        if pix.colorspace is None or pix.n != 3:
                             pix = fitz.Pixmap(fitz.csRGB, pix)
                         # Skip very small images (no point resizing)
                         if pix.width <= max_dim and pix.height <= max_dim:
@@ -959,6 +1129,21 @@ class PdfEngine:
             raise
 
     @staticmethod
+    def _require_tesseract() -> None:
+        """Point pytesseract at the binary, or explain how to install it.
+
+        A ``.app`` launched from Finder gets a PATH without the Homebrew
+        prefixes, so pytesseract's own lookup fails on machines where
+        Tesseract is installed and working.
+        """
+        from app import deps
+        if not deps.configure_pytesseract():
+            raise EngineError(
+                "The Tesseract engine was not found.\n"
+                "Install it with: brew install tesseract"
+            )
+
+    @staticmethod
     def deskew(src: str, dest: str | os.PathLike) -> None:
         """Straighten scanned pages using Tesseract OSD."""
         try:
@@ -968,6 +1153,7 @@ class PdfEngine:
             raise EngineError("pytesseract is required for deskew. "
                               "Install with: pip install pytesseract "
                               "(plus the Tesseract binary).")
+        PdfEngine._require_tesseract()
         try:
             doc = fitz.open(src)
         except Exception as e:
@@ -1006,6 +1192,7 @@ class PdfEngine:
             import pytesseract
         except ImportError:
             raise EngineError("pytesseract is required for OCR.")
+        PdfEngine._require_tesseract()
         try:
             doc = fitz.open(src)
         except Exception as e:
@@ -1031,8 +1218,10 @@ class PdfEngine:
                         new_page.insert_text((x, y), txt, fontsize=size)
                     except Exception:
                         pass
-                # Underlay the original image
-                new_page.insert_image(new_page.rect, pixmap=img,
+                # Underlay the original page image. This takes the fitz
+                # Pixmap; passing the PIL image raises "pixmap must be a
+                # Pixmap" and used to break OCR for every input.
+                new_page.insert_image(new_page.rect, pixmap=pix,
                                        keep_proportion=False, overlay=False)
             out.save(str(dest), deflate=True, garbage=4)
 

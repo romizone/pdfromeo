@@ -79,7 +79,7 @@ class PdfToJpgTool(BaseTool):
         sec2 = self.add_section("Image options")
         sec2.add_widget(form_w)
         self.out = OutputPicker(
-            label="Output folder:", file_filter="Folder"
+            label="Output folder:", mode="dir"
         )
         sec3 = self.add_section("Output folder")
         sec3.add_widget(self.out)
@@ -88,9 +88,7 @@ class PdfToJpgTool(BaseTool):
         if not self.src.first_file() or not self.out.path():
             raise EngineError("Provide source PDF and output folder.")
         from pathlib import Path
-        out = self.out.path()
-        if out.lower().endswith((".jpg", ".png", ".tiff")):
-            out = str(Path(out).parent)
+        out = self.out.directory(Path(self.src.first_file()).parent)
         return pdf_to_images(
             self.src.first_file(), out,
             fmt=self.fmt.currentText(), dpi=int(self.dpi.value()),

@@ -14,7 +14,47 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 
+def _configure_qt_plugins() -> None:
+    """Point Qt at its plugin directory.
+
+    Inside an app bundle Qt cannot work out its own prefix, reports an
+    empty plugin path and aborts before the window appears. Setting the
+    variable here covers both the bundle and a plain source checkout,
+    since either way the plugins sit inside the PySide6 package.
+    """
+    if os.environ.get("QT_PLUGIN_PATH"):
+        return
+
+    candidates = []
+    # In a bundle the plugins sit beside the executable, which is where Qt
+    # looks by default and the only layout it resolves them from.
+    candidates.append(Path(sys.executable).resolve().parent)
+    try:
+        import PySide6
+        candidates.extend(
+            Path(root) / "Qt" / "plugins"
+            for root in getattr(PySide6, "__path__", [])
+        )
+    except ImportError:
+        pass
+
+    for plugins in candidates:
+        if (plugins / "platforms").is_dir():
+            os.environ["QT_PLUGIN_PATH"] = str(plugins)
+            os.environ.setdefault(
+                "QT_QPA_PLATFORM_PLUGIN_PATH", str(plugins / "platforms")
+            )
+            return
+
+
 def main() -> int:
+    # Must happen before anything can import WeasyPrint: teaches ctypes
+    # about the Homebrew library prefixes, which dyld does not search when
+    # the app is launched from Finder.
+    from app import deps
+    deps.configure_native_libs()
+    _configure_qt_plugins()
+
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QIcon, QPalette, QColor
     from PySide6.QtWidgets import QApplication

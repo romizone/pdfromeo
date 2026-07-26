@@ -1,6 +1,7 @@
 """Edit & Sign tools — Sejda-style focused single pages."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
 
 from app.engine import EngineError, PdfEngine
 
+from ..styles import BORDER_STRONG
 from ..widgets import DropZone, OutputPicker
 from .base import BaseTool, Section
 
@@ -37,7 +39,7 @@ class EditTool(BaseTool):
         self.color_swatch.setFixedSize(28, 28)
         self.color_swatch.setStyleSheet(
             f"background-color: {self.color.name()}; "
-            f"border: 1px solid #d1d5db; border-radius: 4px;"
+            f"border: 1px solid {BORDER_STRONG}; border-radius: 4px;"
         )
         self.color_btn = QPushButton("Pick color")
         self.color_btn.clicked.connect(self._pick_color)
@@ -71,7 +73,7 @@ class EditTool(BaseTool):
             self.color = c
             self.color_swatch.setStyleSheet(
                 f"background-color: {c.name()}; "
-                f"border: 1px solid #d1d5db; border-radius: 4px;"
+                f"border: 1px solid {BORDER_STRONG}; border-radius: 4px;"
             )
 
     def run(self, log, progress, is_cancelled) -> Any:
@@ -120,27 +122,34 @@ class FillSignTool(BaseTool):
     def run(self, log, progress, is_cancelled) -> Any:
         if not self.src.first_file() or not self.out.path():
             raise EngineError("Provide source and output paths.")
-        if self.field.text().strip():
+        field_name = self.field.text().strip()
+        if field_name:
+            import fitz
+            doc = fitz.open(self.src.first_file())
             try:
-                import fitz
-                doc = fitz.open(self.src.first_file())
                 filled = False
                 for p in doc:
                     for w in p.widgets() or []:
-                        if w.field_name == self.field.text().strip():
+                        if w.field_name == field_name:
                             w.field_value = self.value.text()
                             w.update()
                             filled = True
-                doc.save(str(self.out.path()))
+                # Check before saving: the old order wrote the output file
+                # even when nothing had been filled in.
+                if not filled:
+                    raise EngineError(
+                        f"No form field named '{field_name}'. "
+                        "Use 'Create Forms' first if you need to add fields."
+                    )
+                try:
+                    doc.save(str(self.out.path()))
+                except Exception as e:
+                    # Previously this was swallowed and misreported as a
+                    # missing field.
+                    raise EngineError(f"Could not save to output: {e}") from e
+            finally:
                 doc.close()
-                if filled:
-                    return None
-            except Exception:
-                pass
-            raise EngineError(
-                f"No form field named '{self.field.text()}'. "
-                "Use 'Create Forms' first if you need to add fields."
-            )
+            return None
         if self.sig_image.first_file():
             import fitz
             doc = fitz.open(self.src.first_file())
@@ -320,7 +329,7 @@ class BatesTool(BaseTool):
         form.addRow("Number width", self.width)
         sec2 = self.add_section("Numbering")
         sec2.add_widget(form_w)
-        self.out = OutputPicker(file_filter="PDF (*.pdf)")
+        self.out = OutputPicker(label="Save to folder:", mode="dir")
         sec3 = self.add_section("Output folder")
         sec3.add_widget(self.out)
 
@@ -328,7 +337,7 @@ class BatesTool(BaseTool):
         files = self.src.files()
         if not files:
             raise EngineError("Add at least one PDF.")
-        out = self.out.path() or str(Path(files[0]).parent)
+        out = self.out.directory(Path(files[0]).parent)
         return PdfEngine.bates_numbering(
             files, self.prefix.text(),
             int(self.start.value()), int(self.width.value()), out,

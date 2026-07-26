@@ -3,10 +3,14 @@ pikepdf>=8.7.0
 pymupdf>=1.24.0
 pypdf>=4.0.0
 pdfplumber>=0.10.4
-# GUI — pinned to 6.7.x because 6.10 ships a Qt platform plugin that
-# doesn't load on Python 3.9 from Xcode on Apple Silicon. 6.7.x works
-# reliably on Python 3.8–3.13 on macOS.
-PySide6>=6.7.0,<6.9.0
+# GUI — Essentials only. The app imports QtCore, QtGui and QtWidgets and
+# nothing else, while the full PySide6 metapackage drags in Qt WebEngine,
+# which alone is over 500 MB in the built bundle.
+#
+# Build with Python 3.11: the Qt platform plugins fail to load under the
+# Python 3.9 that ships with Xcode on Apple Silicon, which leaves the app
+# unable to start at all.
+PySide6-Essentials>=6.7.0,<6.9.0
 # Image processing
 Pillow>=10.2.0
 # OCR (optional - downloads tessdata at runtime)

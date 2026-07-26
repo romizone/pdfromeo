@@ -21,7 +21,7 @@ class ExtractImagesTool(BaseTool):
         sec = self.add_section("Source")
         sec.add_widget(self.src)
         self.out = OutputPicker(
-            label="Output folder:", file_filter="Folder"
+            label="Output folder:", mode="dir"
         )
         sec2 = self.add_section("Output folder")
         sec2.add_widget(self.out)
@@ -29,9 +29,7 @@ class ExtractImagesTool(BaseTool):
     def run(self, log, progress, is_cancelled) -> Any:
         if not self.src.first_file() or not self.out.path():
             raise EngineError("Provide source PDF and output folder.")
-        out = self.out.path()
-        if out.lower().endswith((".png", ".jpg", ".jpeg")):
-            out = str(Path(out).parent)
+        out = self.out.directory(Path(self.src.first_file()).parent)
         return PdfEngine.extract_images(self.src.first_file(), out)
 
 
@@ -53,7 +51,7 @@ class RenameTool(BaseTool):
         sec2 = self.add_section("Rename")
         sec2.add_widget(form_w)
         self.out = OutputPicker(
-            label="Output folder:", file_filter="Folder"
+            label="Output folder:", mode="dir"
         )
         sec3 = self.add_section("Output folder")
         sec3.add_widget(self.out)
@@ -61,9 +59,7 @@ class RenameTool(BaseTool):
     def run(self, log, progress, is_cancelled) -> Any:
         if not self.src.first_file() or not self.out.path():
             raise EngineError("Provide source and output folder.")
-        out = self.out.path()
-        if out.lower().endswith(".pdf"):
-            out = str(Path(out).parent)
+        out = self.out.directory(Path(self.src.first_file()).parent)
         return PdfEngine.rename_by_text(
             self.src.first_file(), int(self.page.value()),
             self.prefix.text(), out,

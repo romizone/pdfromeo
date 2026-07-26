@@ -5,9 +5,7 @@ import it without creating a circular dependency.
 """
 from __future__ import annotations
 
-import shutil
-import subprocess
-import sys
+from app import deps
 
 #: Tool id -> whether the tool needs an open document to operate.
 TOOL_NEEDS_DOC: dict[str, bool] = {
@@ -34,78 +32,59 @@ TOOL_NEEDS_DOC: dict[str, bool] = {
 # ---------------------------------------------------------------------------
 # Optional system / Python dependencies
 # ---------------------------------------------------------------------------
-#: Human-readable name of each optional dep and how to install it.
-_OPTIONAL_DEPS: dict[str, dict[str, str]] = {
-    "tesseract": {
-        "binary": "tesseract",
-        "purpose": "OCR (Tesseract) and Deskew",
-        "install": "brew install tesseract",
-    },
-    "weasyprint": {
-        "binary": "",  # Python module, not a binary
-        "purpose": "HTML → PDF",
-        "install": "brew install cairo pango gdk-pixbuf libffi",
-    },
-    "pages": {
-        "binary": "",
-        "purpose": "Word → PDF (via Apple Pages)",
-        "install": "Install Apple Pages from the App Store",
-    },
+#: tool_id -> requirements. Each inner list is a set of alternatives: the
+#: requirement is met when *any* of them is present. All requirements in the
+#: outer list must be met.
+#:
+#: Word → PDF is the interesting one. It prefers Apple Pages, but
+#: :func:`app.engine.convert.word_to_pdf` falls back to python-docx +
+#: WeasyPrint, which works on every platform — so either route will do.
+TOOL_DEPS: dict[str, list[list[str]]] = {
+    "ocr":         [["tesseract"], ["pytesseract"]],
+    "deskew":      [["tesseract"], ["pytesseract"]],
+    "html_to_pdf": [["weasyprint"]],
+    "word_to_pdf": [["python_docx"], ["pages", "weasyprint"]],
 }
 
 
-def _binary_exists(name: str) -> bool:
-    return shutil.which(name) is not None
+def refresh_dependencies() -> None:
+    """Re-detect dependencies, so a mid-session install is picked up."""
+    deps.refresh()
 
 
-def _weasyprint_importable() -> bool:
-    try:
-        import weasyprint  # noqa: F401
-        return True
-    except Exception:
-        return False
+def dependency_state() -> dict[str, bool]:
+    """Current detection results (mostly useful for tests and debugging)."""
+    return dict(deps.AVAILABLE)
 
 
-#: tool_id -> list of dep keys the tool depends on.
-TOOL_DEPS: dict[str, list[str]] = {
-    "ocr":     ["tesseract"],
-    "deskew":  ["tesseract"],
-    "html_to_pdf": ["weasyprint"],
-    "word_to_pdf": ["pages"],
-}
-
-
-#: Cached at import time so the home page can mark tools correctly.
-def _detect_available_deps() -> dict[str, bool]:
-    return {
-        "tesseract":  _binary_exists("tesseract"),
-        "weasyprint": _weasyprint_importable(),
-        "pages":      sys.platform == "darwin",  # Pages is macOS-only
-    }
-
-
-AVAILABLE_DEPS: dict[str, bool] = _detect_available_deps()
+def _unmet_requirements(tool_id: str) -> list[list[str]]:
+    return [
+        alternatives
+        for alternatives in TOOL_DEPS.get(tool_id, [])
+        if not any(deps.available(key) for key in alternatives)
+    ]
 
 
 def tool_available(tool_id: str) -> bool:
     """Return True if the tool can run on this machine right now."""
-    for dep in TOOL_DEPS.get(tool_id, []):
-        if not AVAILABLE_DEPS.get(dep, True):
-            return False
-    return True
+    return not _unmet_requirements(tool_id)
 
 
 def missing_dep_message(tool_id: str) -> str:
-    """Return a user-friendly message explaining why a tool is disabled."""
-    deps = TOOL_DEPS.get(tool_id, [])
-    if not deps:
+    """Explain why a tool is unavailable, or "" when nothing is missing."""
+    unmet = _unmet_requirements(tool_id)
+    if not unmet:
         return ""
-    lines = ["This tool needs additional system dependencies:\n"]
-    for d in deps:
-        info = _OPTIONAL_DEPS.get(d, {})
-        if AVAILABLE_DEPS.get(d, True):
-            continue
-        lines.append(f"  • {info.get('purpose', d)}")
-        lines.append(f"    Install: {info.get('install', d)}")
+    lines = ["This tool needs additional software:\n"]
+    for alternatives in unmet:
+        described = [deps.describe(key) for key in alternatives]
+        if len(described) == 1:
+            purpose, install = described[0]
+            lines.append(f"  • {purpose}")
+            lines.append(f"    Install: {install}")
+        else:
+            lines.append("  • " + ", or ".join(p for p, _ in described))
+            for purpose, install in described:
+                lines.append(f"    {purpose} — install: {install}")
     lines.append("\nOther tools will work without these.")
     return "\n".join(lines)

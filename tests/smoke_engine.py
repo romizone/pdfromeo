@@ -19,6 +19,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
+from app import deps                 # noqa: E402
+# Same shim the app installs at launch, so the test exercises the real
+# library-lookup path rather than reporting a false "missing libs".
+deps.configure_native_libs()
+
 import fitz                          # noqa: E402
 from PIL import Image                # noqa: E402
 

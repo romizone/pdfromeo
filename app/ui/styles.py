@@ -16,20 +16,27 @@ from PySide6.QtWidgets import QApplication
 # ---------------------------------------------------------------------------
 # Palette
 # ---------------------------------------------------------------------------
-BG_BASE       = "#ffffff"   # main canvas
-BG_PANEL      = "#f7f8fa"   # subtle surface
-BG_RAISED     = "#ffffff"   # cards
-BG_HOVER      = "#f0f4ff"   # light blue tint on hover
-BG_SELECTED   = "#e6efff"   # blue tint when selected
-BORDER        = "#e5e7eb"   # default border
-BORDER_STRONG = "#d1d5db"   # emphasized border
-BORDER_FOCUS  = "#3b82f6"   # blue focus ring
-TEXT_PRIMARY  = "#1f2937"   # slate-800
-TEXT_SECONDARY= "#4b5563"   # slate-600
-TEXT_MUTED    = "#9ca3af"   # slate-400
-ACCENT        = "#3b82f6"   # blue-500 (calm, Sejda-ish)
-ACCENT_HOVER  = "#2563eb"   # blue-600
-ACCENT_SOFT   = "#dbeafe"   # blue-100
+# Brand swatches — the four colours of the PdfRomeo palette. Everything
+# below is derived from these, so re-theming means editing only this block.
+BRAND_BLUE_DEEP = "#2b54b8"   # 1 — royal blue, primary actions
+BRAND_BLUE      = "#4380d6"   # 2 — medium blue, focus and secondary accents
+BRAND_SKY       = "#86c5e6"   # 3 — light blue, soft highlights
+BRAND_CHARCOAL  = "#4a4a4d"   # 4 — neutral dark, text and icons
+
+BG_BASE       = "#ffffff"          # main canvas
+BG_PANEL      = "#f5f7fa"          # subtle surface
+BG_RAISED     = "#ffffff"          # cards
+BG_HOVER      = "#eef3fc"          # blue tint on hover
+BG_SELECTED   = "#dceaf8"          # sky tint when selected
+BORDER        = "#e2e6ec"          # default border
+BORDER_STRONG = "#c9d2de"          # emphasized border
+BORDER_FOCUS  = BRAND_BLUE         # focus ring
+TEXT_PRIMARY  = "#35353a"          # charcoal, darkened for body text
+TEXT_SECONDARY= BRAND_CHARCOAL     # charcoal
+TEXT_MUTED    = "#9a9aa1"          # charcoal, lightened
+ACCENT        = BRAND_BLUE_DEEP    # primary
+ACCENT_HOVER  = "#21449e"          # primary, pressed
+ACCENT_SOFT   = "#e4f0fa"          # sky, heavily tinted
 DANGER        = "#ef4444"
 SUCCESS       = "#10b981"
 
