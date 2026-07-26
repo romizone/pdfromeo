@@ -222,7 +222,10 @@ class BaseTool(QWidget):
 
         self._set_processing(True)
 
-        # Wrap user's run() in callbacks that drive the progress bar
+        # Wrap user's run() in callbacks that drive the progress bar.
+        # We pass the progress / log / cancel hooks *as parameters* to
+        # the user's ``run(log, progress, is_cancelled)`` so we don't
+        # fight with the Worker's own args/kwargs.
         def _progress(value: int, total: int) -> None:
             if total > 0:
                 self.progress.setRange(0, total)
@@ -233,8 +236,16 @@ class BaseTool(QWidget):
         def _log(msg: str) -> None:
             self.progress.setFormat(msg or "Working…")
 
-        # Spin up background thread
-        worker = Worker(self.run, _log, _progress, lambda: False)
+        cancelled = {"v": False}
+
+        def _cancelled() -> bool:
+            return cancelled["v"]
+
+        def runner() -> Any:
+            return self.run(_log, _progress, _cancelled)
+
+        # Spin up background thread — Worker is dumb: just calls runner()
+        worker = Worker(runner)
         self._worker = worker
 
         thread = QThread(self)
@@ -243,8 +254,10 @@ class BaseTool(QWidget):
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_run_done)
         worker.failed.connect(self._on_run_failed)
+        worker.cancelled.connect(lambda: self._on_run_failed("Cancelled."))
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.start()
