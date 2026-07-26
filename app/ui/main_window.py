@@ -1,12 +1,13 @@
 """Main application window — Sejda-style top nav + stack(home, tool)."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
@@ -16,6 +17,42 @@ from PySide6.QtWidgets import (
 from app.engine import EngineError, PdfEngine
 
 from .home import HomeView
+from .tool_registry import TOOL_NEEDS_DOC
+
+
+# Recent files: persist last 5 in ~/Library/Application Support/PdfRomeo/
+# (using plain JSON for portability)
+def _recent_path() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "PdfRomeo" / "recent.json"
+    return Path.home() / ".pdfromeo" / "recent.json"
+
+
+def _load_recent() -> list[str]:
+    p = _recent_path()
+    if not p.exists():
+        return []
+    try:
+        return list(json.loads(p.read_text(encoding="utf-8")))
+    except Exception:
+        return []
+
+
+def _save_recent(items: list[str]) -> None:
+    p = _recent_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(items, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _add_recent(path: str, max_items: int = 5) -> list[str]:
+    items = [x for x in _load_recent() if x != path]
+    items.insert(0, path)
+    items = items[:max_items]
+    _save_recent(items)
+    return items
 
 
 # --- Tool registry (built once at module load, not per click) -------------
@@ -95,33 +132,12 @@ def _build_tool_registry() -> dict:
 TOOL_REGISTRY = _build_tool_registry()
 
 
-# Lookup: tool id -> whether the tool needs an open document
-TOOL_NEEDS_DOC = {
-    "merge": False, "merge_mix": False,
-    "split": True, "split_by_bookmarks": True, "split_in_half": True,
-    "split_by_size": True, "split_by_text": True,
-    "extract": True, "delete_pages": True, "organize": True,
-    "crop": True, "rotate": True, "resize": True,
-    "n_up": True, "flip": True,
-    "edit": True, "fill_sign": True, "create_forms": True,
-    "watermark": True, "header_footer": True, "page_numbers": True,
-    "bates": False, "bookmarks": True, "metadata": True,
-    "remove_annot": True,
-    "pdf_to_word": True, "pdf_to_excel": True, "pdf_to_jpg": True,
-    "pdf_to_pptx": True, "pdf_to_text": True,
-    "html_to_pdf": False, "jpg_to_pdf": False, "word_to_pdf": False,
-    "protect": True, "unlock": True, "flatten": True,
-    "compress": True, "deskew": True, "ocr": True,
-    "grayscale": True, "repair": True,
-    "extract_images": True, "rename": True,
-}
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("PdfRomeo")
         self.resize(1280, 820)
+        self.setAcceptDrops(True)  # global drag-and-drop for PDFs
 
         self._current_path: str | None = None
         self._current_tool_widget: QWidget | None = None
@@ -145,6 +161,7 @@ class MainWindow(QMainWindow):
         # Home (tool grid)
         self.home = HomeView()
         self.home.tool_selected.connect(self._on_tool_selected)
+        self.home.file_selected.connect(self.open_document)
         self.stack.addWidget(self.home)
 
         # Menus
@@ -153,15 +170,15 @@ class MainWindow(QMainWindow):
         # Status bar
         sb = QStatusBar()
         self.setStatusBar(sb)
-        self._status = QLabel("Ready — open a PDF or pick a tool from the home page")
+        self._status = QLabel("Ready — drag a PDF anywhere or pick a tool from the home page")
         sb.addWidget(self._status, 1)
         self._page_info = QLabel("")
         sb.addPermanentWidget(self._page_info)
 
-        # Viewer is hidden — we open the PDF in a small overlay when needed
-        # (kept for compatibility but not added to the visible layout).
-        # (Viewer removed — the tool panel itself handles previews via
-        # the QStackedWidget.)
+        # Load recent files & pass to home view
+        self._recent = _load_recent()
+        self.home.set_recent(self._recent)
+        self.home.set_current_path(self._current_path)
 
     # ------------------------------------------------------------------ UI
 
@@ -321,6 +338,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "PdfRomeo", str(e))
             return
         self._current_path = info.path
+        # Track in recent files
+        self._recent = _add_recent(path)
+        self.home.set_recent(self._recent)
+        self.home.set_current_path(self._current_path)
         # Auto-fill source path into the current tool if it has a "src" widget
         if self._current_tool_widget is not None and hasattr(
             self._current_tool_widget, "src"
@@ -333,6 +354,28 @@ class MainWindow(QMainWindow):
         self._status.setText(
             f"Opened {Path(path).name} — {info.page_count} pages"
         )
+
+    # -- global drag-onto-window -----------------------------------------
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if any(u.toLocalFile().lower().endswith(".pdf")
+                   for u in urls if u.isLocalFile()):
+                event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData().hasUrls():
+            for u in event.mimeData().urls():
+                path = u.toLocalFile()
+                if path and path.lower().endswith(".pdf"):
+                    self.open_document(path)
+                    event.acceptProposedAction()
+                    return
 
     def _update_page_info(self) -> None:
         if self._current_path:
@@ -381,3 +424,5 @@ class MainWindow(QMainWindow):
         self.tool_name.setText(widget.title)
         self.tool_name.setVisible(True)
         self._status.setText(f"Tool ready: {widget.title}")
+        # Auto-focus first input
+        QTimer.singleShot(0, widget.focus_first_input)

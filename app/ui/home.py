@@ -1,12 +1,19 @@
-"""Homepage — a Sejda-style tool grid.
+"""Homepage — a Sejda-style tool grid with recent files.
 
-Replaces the old sidebar. The user lands here on launch (and via "All
-tools" in the top bar). Each tool is a card with icon, title, short
-description. Clicking a card emits :pyattr:`tool_selected(id)`.
+Top of the page:
+  * Hero title + subtitle
+  * Search bar
+  * **Recent files** row (if any)
+
+Then a tool grid grouped by category. Cards whose tools require an open
+PDF are dimmed (via the ``disabled`` dynamic property) until a document
+is loaded.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import Qt, Signal
@@ -16,13 +23,15 @@ from PySide6.QtWidgets import (
     QSizePolicy, QVBoxLayout, QWidget,
 )
 
+from app.ui.tool_registry import TOOL_NEEDS_DOC
+
 
 @dataclass
 class HomeTool:
     id: str
     title: str
     description: str
-    icon: str          # emoji or single character; the design is text-only
+    icon: str
     category: str
 
 
@@ -88,8 +97,17 @@ HOME_CATALOG: list[tuple[str, list[HomeTool]]] = [
 ]
 
 
+def _human_size(n: int) -> str:
+    units = ("B", "KB", "MB", "GB")
+    f = float(n)
+    for u in units:
+        if f < 1024 or u == units[-1]:
+            return f"{f:.0f} {u}" if u == "B" else f"{f:.1f} {u}"
+        f /= 1024
+    return f"{n} B"
+
+
 def _build_card(tool: HomeTool, on_click: Callable[[str], None]) -> QFrame:
-    """Build a single tool card."""
     card = QFrame()
     card.setObjectName("ToolCard")
     card.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -125,13 +143,14 @@ def _build_card(tool: HomeTool, on_click: Callable[[str], None]) -> QFrame:
 
 
 class HomeView(QWidget):
-    """Homepage with hero, search, and a tool grid grouped by category."""
-
     tool_selected = Signal(str)
+    file_selected = Signal(str)  # when a recent-file chip is clicked
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("HomeRoot")
+        self._recent: list[str] = []
+        self._current_path: str | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -147,48 +166,53 @@ class HomeView(QWidget):
         content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         scroll.setWidget(content)
 
-        # Center the content horizontally
         wrap = QVBoxLayout(content)
         wrap.setContentsMargins(40, 40, 40, 40)
         wrap.setSpacing(0)
         wrap.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
 
-        # --- Hero ---
-        hero = QWidget()
-        hero.setObjectName("HomeHero")
-        h = QVBoxLayout(hero)
-        h.setSpacing(8)
-        h.setContentsMargins(0, 0, 0, 0)
+        # --- Hero
         title = QLabel("Every PDF tool you need, in one place.")
         title.setObjectName("HomeHeroTitle")
         title.setWordWrap(True)
-        h.addWidget(title)
+        wrap.addWidget(title)
         sub = QLabel(
-            "Works in your browser, on your desktop, fully offline. "
-            "Pick a tool below to get started — drag & drop supported."
+            "Works on your desktop, fully offline. "
+            "Drag a PDF onto this window, or pick a tool below — "
+            "drop a file onto a tool to start."
         )
         sub.setObjectName("HomeHeroSubtitle")
         sub.setWordWrap(True)
-        h.addWidget(sub)
+        wrap.addWidget(sub)
 
-        # Search field
+        # Search
         self.search = QLineEdit()
         self.search.setObjectName("HomeSearch")
-        self.search.setPlaceholderText("🔍  Search 43 tools… (e.g. merge, watermark, OCR)")
+        self.search.setPlaceholderText(
+            "🔍  Search 43 tools… (e.g. merge, watermark, OCR)"
+        )
         self.search.setMaximumWidth(560)
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._filter)
-        h.addSpacing(12)
-        h.addWidget(self.search)
-        wrap.addWidget(hero)
+        wrap.addSpacing(12)
+        wrap.addWidget(self.search)
         wrap.addSpacing(20)
 
-        # --- Tool grid (per category) ---
+        # Recent files
+        self._recent_w = QWidget()
+        self._recent_layout = QVBoxLayout(self._recent_w)
+        self._recent_layout.setContentsMargins(0, 0, 0, 0)
+        self._recent_layout.setSpacing(8)
+        wrap.addWidget(self._recent_w)
+        wrap.addSpacing(8)
+
+        # Tool grid (per category)
         self._cards: dict[str, QFrame] = {}
-        self._titles: dict[str, QLabel] = {}
+        self._category_labels: dict[str, QLabel] = {}
         for category, tools in HOME_CATALOG:
             cat_label = QLabel(category)
             cat_label.setObjectName("CategoryHeader")
+            self._category_labels[category] = cat_label
             wrap.addWidget(cat_label)
 
             grid = QGridLayout()
@@ -197,7 +221,6 @@ class HomeView(QWidget):
             for i, tool in enumerate(tools):
                 card = _build_card(tool, self.tool_selected.emit)
                 self._cards[tool.id] = card
-                self._titles[tool.id] = cat_label
                 grid.addWidget(card, i // cols, i % cols)
             grid_w = QWidget()
             grid_w.setLayout(grid)
@@ -206,13 +229,74 @@ class HomeView(QWidget):
 
         wrap.addStretch(1)
 
-    # -- public API ------------------------------------------------------
+    # -- public API ---------------------------------------------------
+
+    def set_recent(self, paths: list[str]) -> None:
+        """Update the recent-files strip at the top of the page."""
+        # Clear existing
+        while self._recent_layout.count():
+            item = self._recent_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._recent = [p for p in paths if Path(p).exists()]
+
+        if not self._recent:
+            self._recent_w.setVisible(False)
+            return
+
+        self._recent_w.setVisible(True)
+        header = QLabel("Recent")
+        header.setObjectName("RecentHeader")
+        self._recent_layout.addWidget(header)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        for p in self._recent:
+            try:
+                size = Path(p).stat().st_size
+                meta = _human_size(size)
+            except OSError:
+                meta = ""
+            chip = QFrame()
+            chip.setObjectName("RecentChip")
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.mousePressEvent = (
+                lambda e, pp=p: self.file_selected.emit(pp)
+                if e.button() == Qt.MouseButton.LeftButton else None
+            )
+            v = QVBoxLayout(chip)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(0)
+            v.addWidget(QLabel(Path(p).name))
+            meta_lbl = QLabel(meta)
+            meta_lbl.setObjectName("Muted")
+            meta_lbl.setStyleSheet("font-size: 11px;")
+            v.addWidget(meta_lbl)
+            row.addWidget(chip)
+        row.addStretch(1)
+        self._recent_layout.addLayout(row)
+
+    def set_current_path(self, path: str | None) -> None:
+        """Update the dimmed state of tool cards that require a doc."""
+        self._current_path = path
+        for tool_id, card in self._cards.items():
+            needs_doc = TOOL_NEEDS_DOC.get(tool_id, True)
+            disabled = needs_doc and not path
+            card.setProperty("disabled", disabled)
+            # remove the property when not disabled, to fall back to default
+            if not disabled:
+                card.setProperty("disabled", False)
+            card.style().unpolish(card)
+            card.style().polish(card)
+            card.setCursor(
+                Qt.CursorShape.PointingHandCursor if not disabled
+                else Qt.CursorShape.ForbiddenCursor
+            )
 
     def filter_text(self) -> str:
         return self.search.text()
 
     def _filter(self, text: str) -> None:
-        """Show / hide cards based on the search query."""
         text = text.strip().lower()
         for tool_id, card in self._cards.items():
             if not text:
@@ -227,11 +311,8 @@ class HomeView(QWidget):
             hay = f"{tool.title} {tool.description} {tool.category}".lower()
             card.setVisible(text in hay)
 
-        # Hide category headers when all their cards are hidden
         for category, tools in HOME_CATALOG:
-            any_visible = False
-            for t in tools:
-                if self._cards[t.id].isVisible():
-                    any_visible = True
-                    break
-            self._titles[tools[0].id].setVisible(any_visible)
+            any_visible = any(
+                self._cards[t.id].isVisible() for t in tools
+            )
+            self._category_labels[category].setVisible(any_visible)

@@ -502,6 +502,143 @@ QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
     background: {ACCENT};
     border-color: {ACCENT};
 }}
+
+/* ============ File chip (after upload) ============ */
+#FileChip {{
+    background: {BG_RAISED};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+    padding: 0;
+}}
+#FileChipIcon {{
+    background: {ACCENT_SOFT};
+    color: {ACCENT};
+    border: none;
+    border-top-left-radius: 10px;
+    border-bottom-left-radius: 10px;
+    padding: 0 14px;
+    font-size: 22px;
+}}
+#FileChipName {{
+    color: {TEXT_PRIMARY};
+    font-size: 14px;
+    font-weight: 500;
+    background: transparent;
+    border: none;
+}}
+#FileChipMeta {{
+    color: {TEXT_MUTED};
+    font-size: 12px;
+    background: transparent;
+    border: none;
+}}
+#FileChipRemove {{
+    background: transparent;
+    color: {TEXT_MUTED};
+    border: none;
+    border-top-right-radius: 10px;
+    border-bottom-right-radius: 10px;
+    padding: 0 12px;
+    font-size: 18px;
+    font-weight: 600;
+}}
+#FileChipRemove:hover {{
+    background: #fee2e2;
+    color: {DANGER};
+}}
+
+/* ============ Run button states ============ */
+QPushButton#Primary[processing="true"] {{
+    background: {ACCENT};
+    color: white;
+}}
+QPushButton#Primary[processing="true"]:hover {{
+    background: {ACCENT_HOVER};
+}}
+QPushButton#Primary:disabled {{
+    background: {BORDER};
+    color: {TEXT_MUTED};
+}}
+
+/* ============ Progress (inline) ============ */
+QProgressBar#InlineProgress {{
+    background: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    text-align: center;
+    color: {TEXT_PRIMARY};
+    height: 22px;
+    font-size: 12px;
+}}
+QProgressBar#InlineProgress::chunk {{
+    background: {ACCENT};
+    border-radius: 7px;
+}}
+
+/* ============ Tool card dimmed (no doc open) ============ */
+#ToolCard[disabled="true"] {{
+    background: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 12px;
+    opacity: 0.55;
+}}
+#ToolCard[disabled="true"] #ToolCardTitle {{
+    color: {TEXT_MUTED};
+}}
+#ToolCard[disabled="true"] #ToolCardIcon {{
+    background: {BORDER};
+    color: {TEXT_MUTED};
+}}
+
+/* ============ Recent files strip ============ */
+#RecentHeader {{
+    color: {TEXT_PRIMARY};
+    font-size: 14px;
+    font-weight: 600;
+    padding: 4px 0;
+}}
+#RecentChip {{
+    background: {BG_RAISED};
+    border: 1px solid {BORDER};
+    border-radius: 18px;
+    padding: 8px 14px;
+    color: {TEXT_PRIMARY};
+    font-size: 13px;
+}}
+#RecentChip:hover {{
+    border-color: {ACCENT};
+    background: {BG_HOVER};
+}}
+
+/* ============ Drag overlay ============ */
+#DragOverlay {{
+    background: rgba(59, 130, 246, 200);
+    border: 4px dashed white;
+    border-radius: 16px;
+}}
+#DragOverlayText {{
+    color: white;
+    font-size: 28px;
+    font-weight: 700;
+}}
+
+/* ============ Success banner (after processing) ============ */
+#SuccessBanner {{
+    background: #ecfdf5;
+    border: 1px solid #a7f3d0;
+    border-radius: 10px;
+    padding: 14px 18px;
+}}
+#SuccessBannerText {{
+    color: #047857;
+    font-size: 14px;
+    font-weight: 500;
+}}
+#SuccessBannerPath {{
+    color: #065f46;
+    font-size: 12px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}}
 """
 
 
