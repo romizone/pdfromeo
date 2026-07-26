@@ -26,7 +26,7 @@ and [PyMuPDF](https://pymupdf.readthedocs.io/).
 - **Crop**, **Rotate**, **Resize**, **N-up**, **Flip**
 
 ### ✏️ Edit & Sign
-- **PDF Editor** — add text, shapes, images
+- **PDF Editor** — click the page to place text, or click existing text to rewrite it
 - **Fill & Sign** — form fields + signature image
 - **Create Forms** — make existing PDFs fillable
 - **Watermark**, **Header & Footer**, **Page Numbers**

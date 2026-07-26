@@ -732,6 +732,212 @@ class PdfEngine:
             try: doc.close()
             except Exception: pass
 
+    # ------------------------------------------------------------------
+    # Text: reading existing spans, placing new text, replacing old text
+    # ------------------------------------------------------------------
+
+    #: Span flag bits PyMuPDF reports for a piece of text.
+    _FLAG_ITALIC = 1 << 1
+    _FLAG_SERIF = 1 << 2
+    _FLAG_MONO = 1 << 3
+    _FLAG_BOLD = 1 << 4
+
+    #: Base-14 font names, keyed by (serif, mono, bold, italic).
+    _BASE14 = {
+        ("sans", False, False): "helv", ("sans", True, False): "hebo",
+        ("sans", False, True): "heit",  ("sans", True, True): "hebi",
+        ("serif", False, False): "tiro", ("serif", True, False): "tibo",
+        ("serif", False, True): "tiit",  ("serif", True, True): "tibi",
+        ("mono", False, False): "cour", ("mono", True, False): "cobo",
+        ("mono", False, True): "coit",  ("mono", True, True): "cobi",
+    }
+
+    @staticmethod
+    def substitute_font(font_name: str, flags: int = 0) -> str:
+        """Pick the base-14 font closest to an embedded one.
+
+        Embedded fonts cannot be reused for new glyphs without the original
+        font file, so replacement text is drawn in the nearest standard
+        face. The name is consulted as well as the flags, because some
+        producers leave the flags empty.
+        """
+        lowered = (font_name or "").lower()
+        bold = bool(flags & PdfEngine._FLAG_BOLD) or "bold" in lowered
+        italic = (
+            bool(flags & PdfEngine._FLAG_ITALIC)
+            or "italic" in lowered or "oblique" in lowered
+        )
+        if flags & PdfEngine._FLAG_MONO or any(
+            token in lowered for token in ("mono", "courier", "consol")
+        ):
+            family = "mono"
+        elif flags & PdfEngine._FLAG_SERIF or any(
+            token in lowered
+            for token in ("times", "serif", "georgia", "roman", "garamond",
+                          "book", "minion")
+        ):
+            family = "serif"
+        else:
+            family = "sans"
+        return PdfEngine._BASE14[(family, bold, italic)]
+
+    @staticmethod
+    def text_spans(src: str, page_1based: int) -> list[dict]:
+        """Every run of text on a page, with position and appearance.
+
+        This is what makes editing existing text possible: the caller can
+        find the span under a click and knows its box, size, font and
+        colour.
+        """
+        try:
+            doc = fitz.open(src)
+        except Exception as e:
+            raise EngineError(f"Could not open: {e}") from e
+        spans: list[dict] = []
+        with doc:
+            if page_1based < 1 or page_1based > len(doc):
+                raise EngineError(f"Page {page_1based} out of range.")
+            page = doc[page_1based - 1]
+            for block in page.get_text("dict").get("blocks", []):
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = span.get("text", "")
+                        if not text.strip():
+                            continue
+                        packed = int(span.get("color", 0))
+                        spans.append({
+                            "text": text,
+                            "bbox": tuple(span["bbox"]),
+                            "size": float(span.get("size", 11)),
+                            "font": span.get("font", ""),
+                            "flags": int(span.get("flags", 0)),
+                            "color": (
+                                ((packed >> 16) & 255) / 255.0,
+                                ((packed >> 8) & 255) / 255.0,
+                                (packed & 255) / 255.0,
+                            ),
+                        })
+        return spans
+
+    @staticmethod
+    def add_text_items(src: str, items: Sequence[dict],
+                       dest: str | os.PathLike | None = None) -> None:
+        """Stamp several pieces of text in one pass.
+
+        Each item needs ``page`` (1-based), ``x``, ``y`` and ``text``, and
+        may carry ``size``, ``color`` and ``fontname``. ``y`` is the text
+        baseline, measured from the top of the page.
+        """
+        if not items:
+            raise EngineError("Nothing to add.")
+        try:
+            doc = fitz.open(src)
+        except Exception as e:
+            raise EngineError(f"Could not open: {e}") from e
+        try:
+            for item in items:
+                page_number = int(item.get("page", 1))
+                if page_number < 1 or page_number > len(doc):
+                    raise EngineError(f"Page {page_number} out of range.")
+                page = doc[page_number - 1]
+                page.insert_text(
+                    (float(item["x"]), float(item["y"])),
+                    str(item.get("text", "")),
+                    fontsize=float(item.get("size", 12)),
+                    fontname=item.get("fontname", "helv"),
+                    color=tuple(item.get("color", (0, 0, 0))),
+                )
+            doc.save(str(dest or src), deflate=True, garbage=4)
+        finally:
+            try: doc.close()
+            except Exception: pass
+
+    @staticmethod
+    def replace_text_spans(src: str, edits: Sequence[dict],
+                           dest: str | os.PathLike | None = None) -> None:
+        """Rewrite existing text: cover the old glyphs, draw the new ones.
+
+        Each edit needs ``page`` (1-based), ``bbox`` and ``text``, and may
+        carry ``size``, ``color`` and ``font`` (the original font name,
+        which is mapped onto a standard face).
+
+        The old text is removed with a redaction so it cannot be recovered
+        by copy-paste. Redactions are applied per page, then the
+        replacement is drawn into the same box, shrinking the type if the
+        new text is longer than the old.
+        """
+        if not edits:
+            raise EngineError("Nothing to replace.")
+        try:
+            doc = fitz.open(src)
+        except Exception as e:
+            raise EngineError(f"Could not open: {e}") from e
+        try:
+            by_page: dict[int, list[dict]] = {}
+            for edit in edits:
+                page_number = int(edit.get("page", 1))
+                if page_number < 1 or page_number > len(doc):
+                    raise EngineError(f"Page {page_number} out of range.")
+                by_page.setdefault(page_number, []).append(edit)
+
+            for page_number, page_edits in by_page.items():
+                page = doc[page_number - 1]
+                for edit in page_edits:
+                    x0, y0, x1, y1 = (float(v) for v in edit["bbox"])
+                    # A hair of margin, so anti-aliased edges of the old
+                    # glyphs are covered too.
+                    page.add_redact_annot(
+                        fitz.Rect(x0 - 0.6, y0 - 0.6, x1 + 0.6, y1 + 0.6)
+                    )
+                try:
+                    page.apply_redactions(images=0)
+                except TypeError:
+                    # Older PyMuPDF has no images= keyword.
+                    page.apply_redactions()
+
+                for edit in page_edits:
+                    text = str(edit.get("text", ""))
+                    if not text:
+                        continue
+                    x0, y0, x1, y1 = (float(v) for v in edit["bbox"])
+                    size = float(edit.get("size", 11))
+                    fontname = edit.get("fontname") or PdfEngine.substitute_font(
+                        edit.get("font", ""), int(edit.get("flags", 0))
+                    )
+                    colour = tuple(edit.get("color", (0, 0, 0)))
+                    # Give the box room to the right; replacement text is
+                    # often longer than what it replaces.
+                    box = fitz.Rect(x0, y0 - 1, max(x1, x0 + 4), y1 + 2)
+                    box.x1 = min(page.rect.x1 - 2, max(box.x1, x0 + 4))
+                    PdfEngine._fit_textbox(
+                        page, box, text, size, fontname, colour
+                    )
+            doc.save(str(dest or src), deflate=True, garbage=4)
+        finally:
+            try: doc.close()
+            except Exception: pass
+
+    @staticmethod
+    def _fit_textbox(page, box, text: str, size: float,
+                     fontname: str, colour) -> None:
+        """Draw ``text`` in ``box``, shrinking until it fits."""
+        attempt = size
+        for _ in range(12):
+            result = page.insert_textbox(
+                box, text, fontsize=attempt, fontname=fontname,
+                color=colour, align=fitz.TEXT_ALIGN_LEFT,
+            )
+            if result >= 0:
+                return
+            attempt *= 0.9
+            if attempt < 4:
+                break
+        # Last resort: a single baseline write, which cannot fail on width.
+        page.insert_text(
+            (box.x0, box.y1 - 1), text, fontsize=max(4.0, attempt),
+            fontname=fontname, color=colour,
+        )
+
     @staticmethod
     def add_rectangle(src: str, page_1based: int,
                       rect: tuple[float, float, float, float],

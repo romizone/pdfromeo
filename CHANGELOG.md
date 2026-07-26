@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.2.0
+
+The app now shows the document it is working on, and the editor is driven
+by clicking the page instead of typing coordinates.
+
+### Every tool shows the page
+
+- A rendered page sits beside the options, with page navigation, zoom and
+  fit-to-width. Until now nothing in the app displayed a PDF at all: a
+  complete viewer existed in `app/ui/viewer.py` but was never instantiated,
+  so all 43 tools were operated blind and the result had to be opened
+  somewhere else to see what had happened.
+- Tool pages are laid out in two panes — options on the left, document on
+  the right. Tools with no PDF to show (HTML → PDF, Images → PDF) collapse
+  the pane and centre their options.
+- After a run, the pane switches to the file that was just produced, so the
+  result is visible immediately.
+
+### The editor is a canvas
+
+- **Click the page to place text.** The click sets the text baseline, so
+  the *Page*, *X position (pt)* and *Y position (pt)* fields are gone.
+  Placed items are listed and can be removed before saving; each one is
+  marked on the page.
+- **Click existing text to rewrite it.** Editable text is outlined; picking
+  a piece of it opens the current wording for editing. This is new — the
+  engine previously had no way to alter text that was already in a
+  document, only to stamp more on top.
+  - The original glyphs are removed with a redaction rather than covered,
+    so the old wording cannot be recovered by copy-paste.
+  - Size, colour and font are carried over from the text being replaced.
+    Embedded fonts cannot be reused for new glyphs without the original
+    font file, so the nearest standard face is chosen from the font's name
+    and flags — serif, monospace, bold and italic are all preserved.
+  - A replacement longer than the original is shrunk until it fits.
+- Several placements and rewrites can be queued and applied in one pass.
+- The editor's subtitle no longer promises images and shapes, which it
+  never offered.
+
+New engine functions: `PdfEngine.text_spans`, `add_text_items`,
+`replace_text_spans` and `substitute_font`, each covered by
+`tests/regression.py`.
+
 ## 1.1.4
 
 Fixes the `.dmg` published with 1.1.3, which macOS rejected as *"PdfRomeo

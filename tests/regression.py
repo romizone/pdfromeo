@@ -197,6 +197,97 @@ def test_dependency_gate() -> None:
         deps.AVAILABLE.update(original)
 
 
+def _styled_pdf(path: str) -> None:
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 100), "Invoice INV-2026-0042", fontsize=20,
+                     fontname="hebo")
+    page.insert_text((72, 140), "Amount due: 1250000", fontsize=13,
+                     fontname="tiro")
+    page.insert_text((72, 180), "Terms: net 30", fontsize=11, fontname="cour")
+    doc.save(path)
+    doc.close()
+
+
+def test_text_spans(tmp: Path) -> None:
+    """Reading existing text is what makes editing it possible."""
+    src = str(tmp / "spans.pdf")
+    _styled_pdf(src)
+    spans = PdfEngine.text_spans(src, 1)
+    texts = [s["text"] for s in spans]
+    check("text_spans finds every run of text", len(spans) == 3, str(texts))
+    check("text_spans reports a usable box",
+          all(s["bbox"][2] > s["bbox"][0] for s in spans))
+    substitutes = {
+        s["text"][:7]: PdfEngine.substitute_font(s["font"], s["flags"])
+        for s in spans
+    }
+    check("bold, serif and mono map to the right standard faces",
+          substitutes.get("Invoice") == "hebo"
+          and substitutes.get("Amount ") == "tiro"
+          and substitutes.get("Terms: ") == "cour",
+          str(substitutes))
+
+
+def test_add_text_items(tmp: Path) -> None:
+    """Click-to-place stamps several items in one pass."""
+    src = str(tmp / "add_src.pdf")
+    _styled_pdf(src)
+    out = str(tmp / "add_out.pdf")
+    PdfEngine.add_text_items(src, [
+        {"page": 1, "x": 300, "y": 105, "text": "PAID", "size": 24,
+         "color": (0.1, 0.5, 0.2)},
+        {"page": 1, "x": 72, "y": 240, "text": "Approved", "size": 12},
+    ], out)
+    with fitz.open(out) as doc:
+        text = doc[0].get_text()
+    check("both placed items are written", "PAID" in text and "Approved" in text,
+          repr(text))
+    check("the original content survives placement",
+          "Invoice INV-2026-0042" in text)
+
+
+def test_replace_text_spans(tmp: Path) -> None:
+    """Editing existing text must remove the old glyphs, not cover them."""
+    src = str(tmp / "rep_src.pdf")
+    _styled_pdf(src)
+    target = [s for s in PdfEngine.text_spans(src, 1)
+              if "1250000" in s["text"]][0]
+    out = str(tmp / "rep_out.pdf")
+    PdfEngine.replace_text_spans(src, [{
+        "page": 1, "bbox": target["bbox"], "text": "Amount due: 9.750.000",
+        "size": target["size"], "color": target["color"],
+        "font": target["font"], "flags": target["flags"],
+    }], out)
+    with fitz.open(out) as doc:
+        text = doc[0].get_text()
+    check("the replacement text is present", "9.750.000" in text, repr(text))
+    check("the replaced text is gone, not just hidden",
+          "1250000" not in text.replace(".", ""), repr(text))
+    check("neighbouring text is untouched",
+          "Invoice INV-2026-0042" in text and "Terms: net 30" in text,
+          repr(text))
+
+
+def test_replacement_shrinks_to_fit(tmp: Path) -> None:
+    """A longer replacement must not overflow or vanish."""
+    src = str(tmp / "fit_src.pdf")
+    _styled_pdf(src)
+    target = [s for s in PdfEngine.text_spans(src, 1)
+              if s["text"].startswith("Terms")][0]
+    out = str(tmp / "fit_out.pdf")
+    long_text = "Terms: payment due within thirty calendar days of invoice"
+    PdfEngine.replace_text_spans(src, [{
+        "page": 1, "bbox": target["bbox"], "text": long_text,
+        "size": target["size"], "font": target["font"],
+        "flags": target["flags"],
+    }], out)
+    with fitz.open(out) as doc:
+        text = " ".join(doc[0].get_text().split())
+    check("a long replacement still lands on the page",
+          "thirty calendar days" in text, repr(text))
+
+
 def main() -> int:
     print("PdfRomeo regression tests\n")
     with tempfile.TemporaryDirectory(prefix="pdfromeo_reg_") as raw:
@@ -206,6 +297,10 @@ def main() -> int:
         test_split_by_size(tmp)
         test_watermark(tmp)
         test_compress_grayscale(tmp)
+        test_text_spans(tmp)
+        test_add_text_items(tmp)
+        test_replace_text_spans(tmp)
+        test_replacement_shrinks_to_fit(tmp)
     test_page_order_parsing()
     test_dependency_gate()
 

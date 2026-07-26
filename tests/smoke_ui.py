@@ -155,10 +155,55 @@ def main() -> int:
               f"{reg_ids - needs_doc_ids}, "
               f"extra: {needs_doc_ids - reg_ids}")
 
+    # 5) every PDF tool shows the document, and the editor is click-driven
+    print("\nPreview and editor:")
+    previewed = 0
+    for tool_id in ("rotate", "watermark", "compress", "protect", "ocr"):
+        win._on_tool_selected(tool_id)
+        app.processEvents()
+        tool = win._current_tool_widget
+        preview = getattr(tool, "preview", None)
+        if preview is None or preview.page_count() == 0:
+            print(f"  ⚠️  {tool_id} shows no page preview")
+            failures += 1
+        else:
+            previewed += 1
+    print(f"  ok  {previewed} tools render the source document")
+
+    win._on_tool_selected("edit")
+    app.processEvents()
+    editor = win._current_tool_widget
+    labels = {
+        editor._form.itemAt(i, editor._form.ItemRole.LabelRole).widget().text()
+        for i in range(editor._form.rowCount())
+    }
+    if labels & {"X position (pt)", "Y position (pt)", "Page (1-based)"}:
+        print(f"  ⚠️  editor still asks for coordinates: {sorted(labels)}")
+        failures += 1
+    else:
+        print(f"  ok  editor asks for {sorted(labels)} — no coordinates")
+
+    editor.text.setText("PAID")
+    editor._on_page_clicked(0, 300.0, 105.0)
+    if editor.change_list.count() != 1:
+        print("  ⚠️  clicking the page did not queue a placement")
+        failures += 1
+    else:
+        print(f"  ok  click queued: {editor.change_list.item(0).text()}")
+
+    editor.mode.setCurrentIndex(1)
+    app.processEvents()
+    if not editor._spans:
+        print("  ⚠️  editor found no existing text to outline")
+        failures += 1
+    else:
+        print(f"  ok  {len(editor._spans)} existing text spans are editable")
+
     if failures:
-        print(f"\n❌ {failures} tools failed to instantiate.")
+        print(f"\n❌ {failures} checks failed.")
         return 1
-    print(f"\n✅ All {len(registry)} tool panels + home + search work.")
+    print(f"\n✅ All {len(registry)} tool panels + home + search + "
+          "preview + editor work.")
     return 0
 
 

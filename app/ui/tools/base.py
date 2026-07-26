@@ -34,6 +34,8 @@ from PySide6.QtWidgets import (
 
 from app.workers.background import Worker
 
+from ..preview import PagePreview
+
 
 #: Threads still running, kept alive here rather than being parented to the
 #: tool page. A tool page is deleted as soon as the user navigates away, and
@@ -75,6 +77,13 @@ class BaseTool(QWidget):
     title: str = "Tool"
     subtitle: str = ""
 
+    #: Show the rendered source document under the options. Tools that build
+    #: their own canvas (the editor) set this to False and place one
+    #: themselves.
+    preview_enabled: bool = True
+    #: Report clicks on the page as PDF coordinates.
+    preview_interactive: bool = False
+
     #: Emitted from the worker thread; delivered on the GUI thread, which is
     #: the only thread allowed to touch the progress bar.
     progress_changed = Signal(int, int)
@@ -89,25 +98,45 @@ class BaseTool(QWidget):
         self._last_outputs: list[str] = []     # outputs from last successful run
         self._success_banner: QFrame | None = None
 
-        outer = QVBoxLayout(self)
+        # Two panes: options on the left, the document on the right. The
+        # right pane collapses for tools that have nothing to show, and the
+        # options then centre themselves.
+        outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # -- scrollable centered content
+        # -- scrollable options column
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        outer.addWidget(scroll, 1)
+        outer.addWidget(scroll, 3)
 
+        centring = QWidget()
+        centring_layout = QHBoxLayout(centring)
+        centring_layout.setContentsMargins(0, 0, 0, 0)
+        centring_layout.setSpacing(0)
+        centring_layout.addStretch(1)
         content = QWidget()
         content.setMaximumWidth(860)
-        content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        scroll.setWidget(content)
+        content.setSizePolicy(QSizePolicy.Policy.Preferred,
+                              QSizePolicy.Policy.Preferred)
+        centring_layout.addWidget(content, 8)
+        centring_layout.addStretch(1)
+        scroll.setWidget(centring)
 
         wrap = QVBoxLayout(content)
         wrap.setContentsMargins(40, 32, 40, 32)
         wrap.setSpacing(0)
-        wrap.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        wrap.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        # -- document pane
+        self._preview_pane = QWidget()
+        self._preview_pane.setObjectName("PreviewPane")
+        self._preview_layout = QVBoxLayout(self._preview_pane)
+        self._preview_layout.setContentsMargins(0, 24, 24, 24)
+        self._preview_layout.setSpacing(10)
+        self._preview_pane.setVisible(False)
+        outer.addWidget(self._preview_pane, 4)
 
         # --- Header
         header = QWidget()
@@ -133,8 +162,18 @@ class BaseTool(QWidget):
         wrap.addWidget(self._sections_host)
         wrap.addStretch(1)
 
+        # Created before build_ui so subclasses can wire up its signals and
+        # add their own widgets alongside it.
+        self.preview: PagePreview | None = None
+        if self.preview_enabled:
+            self.preview = PagePreview(interactive=self.preview_interactive)
+            self._preview_layout.addWidget(self.preview, 1)
+
         # Build subclass UI
         self.build_ui()
+
+        # Follow whichever DropZone holds this tool's source document.
+        self._wire_preview_source()
 
         # --- Primary action row + inline progress + success banner
         actions_w = QWidget()
@@ -187,6 +226,39 @@ class BaseTool(QWidget):
         """True while a background job is still running."""
         thread = self._thread
         return thread is not None and thread.isRunning()
+
+    # -- preview ----------------------------------------------------------
+
+    def add_preview_widget(self, widget: QWidget) -> None:
+        """Put a widget above the page, in the document pane."""
+        self._preview_layout.insertWidget(
+            self._preview_layout.count() - 1, widget
+        )
+
+    def _wire_preview_source(self) -> None:
+        """Make the document pane follow this tool's source DropZone."""
+        if self.preview is None:
+            return
+        source = getattr(self, "src", None)
+        if source is None or not hasattr(source, "filesChanged"):
+            # Nothing to preview; give the space back to the options.
+            self._preview_pane.setVisible(False)
+            self.preview = None
+            return
+        self._preview_pane.setVisible(True)
+        source.filesChanged.connect(self._on_source_files_changed)
+        # A tool opened with a document already loaded gets it straight away.
+        self._on_source_files_changed(source.files())
+
+    def _on_source_files_changed(self, files: list) -> None:
+        if self.preview is None:
+            return
+        pdfs = [f for f in files if str(f).lower().endswith(".pdf")]
+        self.preview.load(pdfs[0] if pdfs else None)
+        self.source_preview_loaded(self.preview.path())
+
+    def source_preview_loaded(self, path: str | None) -> None:  # noqa: D401
+        """Hook for subclasses; called after the preview loads a document."""
 
     # -- subclass hooks ---------------------------------------------------
 
@@ -310,6 +382,13 @@ class BaseTool(QWidget):
         elif isinstance(result, (list, tuple)):
             outputs = [r for r in result if isinstance(r, str)]
         self._last_outputs = outputs
+        # Show the result rather than making the user open it elsewhere.
+        if self.preview is not None:
+            produced = [o for o in outputs if str(o).lower().endswith(".pdf")]
+            if produced:
+                self.preview.load(produced[0])
+            else:
+                self.preview.reload()
         self._show_success(outputs)
 
     def _on_run_failed(self, message: str) -> None:

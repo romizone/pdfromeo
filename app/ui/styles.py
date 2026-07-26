@@ -600,6 +600,25 @@ QProgressBar#InlineProgress::chunk {{
     border-color: {BORDER};
 }}
 
+/* ============ Page preview ============ */
+#PreviewPane {{
+    background: {BG_PANEL};
+    border-left: 1px solid {BORDER};
+}}
+
+#PreviewScroll {{
+    background: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+}}
+#PreviewScroll > QWidget > QWidget {{
+    background: {BG_PANEL};
+}}
+#PreviewRoot QLabel[pageCanvas="true"] {{
+    background: {BG_BASE};
+    border: 1px solid {BORDER_STRONG};
+}}
+
 /* ============ Recent files strip ============ */
 #RecentHeader {{
     color: {TEXT_PRIMARY};
