@@ -123,6 +123,29 @@ xcrun stapler staple dist/PdfRomeo.dmg
 
 ---
 
+## 📥 Installing the `.dmg`
+
+The app is signed ad-hoc, not with an Apple Developer ID, so macOS refuses
+it on first launch — usually with *"PdfRomeo is damaged and can't be
+opened"*. That message is Gatekeeper declining to vouch for an
+unnotarised app, not a corrupted download.
+
+1. Open the `.dmg` and drag **PdfRomeo** into **Applications**.
+2. Clear the download quarantine flag:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/PdfRomeo.app
+```
+
+3. Launch normally.
+
+Removing that flag is what makes the app open; right-click → *Open* alone
+is often not enough for an ad-hoc signature on Apple Silicon. To drop the
+step entirely, sign and notarise with a paid Developer ID — see
+`scripts/build_macos.sh`.
+
+---
+
 ## 🧩 System dependencies
 
 | Feature | Needs | Install |

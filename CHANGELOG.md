@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.1.4
+
+Fixes the `.dmg` published with 1.1.3, which macOS rejected as *"PdfRomeo
+is damaged and can't be opened"*.
+
+- The build pruned unused Qt frameworks *after* py2app had signed the
+  bundle, which left the signature sealing a manifest of files that no
+  longer existed. Gatekeeper reported `a sealed resource is missing or
+  invalid`, and that surfaces as "damaged" with no way for the user to
+  override it. The bundle is now re-signed after pruning, and the build
+  fails loudly if the signature does not verify.
+- Signing happens on a copy in a scratch directory. `codesign` rejects any
+  bundle carrying extended attributes, and these cannot be cleared in
+  place: `com.apple.provenance` is kernel-managed, and a synced folder
+  keeps re-stamping the bundle with `com.apple.FinderInfo`.
+- The disk image now contains an `Applications` symlink, so installing is
+  a drag.
+- README documents the `xattr -dr com.apple.quarantine` step, which is
+  still required because the app is ad-hoc signed rather than notarised.
+
+No application code changed; 1.1.3's fixes are all present.
+
 ## 1.1.3
 
 A bug-fix release. Several tools had never worked; the dependency detection

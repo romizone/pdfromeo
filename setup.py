@@ -202,6 +202,85 @@ def _prune_pyside(bundle: Path) -> None:
     print(f"  removed {removed} unused Qt components")
 
 
+def _resign(bundle: Path) -> None:
+    """Re-sign the bundle after its contents changed.
+
+    py2app ad-hoc signs the app, sealing a manifest of every file inside
+    it. Pruning afterwards invalidates that seal, and macOS reports the
+    result as "PdfRomeo is damaged and can't be opened" — a Gatekeeper
+    refusal the user cannot work around. Signing again rebuilds the seal.
+
+    This is still only an ad-hoc signature. Distributing it publicly wants
+    a Developer ID and notarisation; see scripts/build_macos.sh.
+    """
+    import shutil
+    import subprocess
+
+    # A dangling symlink py2app leaves behind; codesign trips over it.
+    for path in bundle.rglob("*"):
+        if path.is_symlink() and not path.exists():
+            path.unlink(missing_ok=True)
+
+    # codesign refuses to sign a bundle carrying extended attributes:
+    # "resource fork, Finder information, or similar detritus not allowed".
+    # They cannot be stripped in place — com.apple.provenance is
+    # kernel-managed on recent macOS, and a synced folder (iCloud Drive and
+    # friends) keeps re-stamping the bundle directory with FinderInfo. So
+    # the signing happens on a ditto copy in a scratch directory outside
+    # any synced tree, then the result is copied back.
+    import tempfile
+
+    scratch = Path(tempfile.mkdtemp(prefix="pdfromeo-sign-"))
+    staged = scratch / bundle.name
+    try:
+        copy = subprocess.run(
+            ["ditto", "--noextattr", "--norsrc", str(bundle), str(staged)],
+            capture_output=True, text=True,
+        )
+        if copy.returncode != 0:
+            raise SystemExit("ditto failed:\n" + copy.stderr.strip())
+
+        result = subprocess.run(
+            ["codesign", "--force", "--deep", "--sign", "-", str(staged)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise SystemExit(
+                "codesign failed, so macOS would report the app as damaged:\n"
+                + result.stderr.strip()
+            )
+
+        verify = subprocess.run(
+            ["codesign", "--verify", "--deep", "--strict", str(staged)],
+            capture_output=True, text=True,
+        )
+        if verify.returncode != 0:
+            raise SystemExit(
+                "the signature does not verify:\n" + verify.stderr.strip()
+            )
+
+        shutil.rmtree(bundle)
+        back = subprocess.run(
+            ["ditto", "--noextattr", "--norsrc", str(staged), str(bundle)],
+            capture_output=True, text=True,
+        )
+        if back.returncode != 0:
+            raise SystemExit("ditto back failed:\n" + back.stderr.strip())
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    # The seal is what Gatekeeper reads; a stray attribute on the bundle
+    # directory re-added by a syncing folder does not invalidate it.
+    sealed = subprocess.run(
+        ["codesign", "--verify", str(bundle)], capture_output=True, text=True
+    )
+    if sealed.returncode != 0:
+        raise SystemExit(
+            "the copied bundle's seal is broken:\n" + sealed.stderr.strip()
+        )
+    print("  signature rebuilt and verified")
+
+
 # py2app rejects both ``setup_requires`` and ``install_requires``; the
 # runtime dependencies live in requirements.txt, which the build script
 # installs into the virtualenv before invoking this file.
@@ -218,4 +297,6 @@ if "py2app" in sys.argv:
     if app_bundle.is_dir():
         print("Pruning unused Qt components…")
         _prune_pyside(app_bundle)
+        print("Re-signing the bundle…")
+        _resign(app_bundle)
         print("Done.")

@@ -86,7 +86,16 @@ if command -v create-dmg >/dev/null 2>&1; then
 else
   echo "create-dmg not found. Install with: brew install create-dmg"
   echo "Skipping DMG step. You can run hdiutil manually:"
-  echo "  hdiutil create -volname PdfRomeo -srcfolder dist/PdfRomeo.app -ov -format UDZO dist/PdfRomeo.dmg"
+  STAGE="$(mktemp -d)"
+  # Stage through ditto: the .dmg must not carry the extended attributes
+  # that a synced project folder stamps onto the bundle.
+  ditto --noextattr --norsrc dist/PdfRomeo.app "$STAGE/PdfRomeo.app"
+  ln -s /Applications "$STAGE/Applications"
+  codesign --verify --deep --strict "$STAGE/PdfRomeo.app"
+  hdiutil create -volname "PdfRomeo $(python -c 'import app; print(app.__version__)')" \
+    -srcfolder "$STAGE" -ov -format UDZO dist/PdfRomeo.dmg
+  rm -rf "$STAGE"
+  echo "==> Built: dist/PdfRomeo.dmg"
 fi
 
 echo
