@@ -575,7 +575,7 @@ QProgressBar#InlineProgress::chunk {{
     border-radius: 7px;
 }}
 
-/* ============ Tool card dimmed (no doc open) ============ */
+/* ============ Tool card dimmed (no doc open or sys dep missing) ============ */
 #ToolCard[disabled="true"] {{
     background: {BG_PANEL};
     border: 1px solid {BORDER};
@@ -588,6 +588,9 @@ QProgressBar#InlineProgress::chunk {{
 #ToolCard[disabled="true"] #ToolCardIcon {{
     background: {BORDER};
     color: {TEXT_MUTED};
+}}
+#ToolCard[disabled="true"]:hover {{
+    border-color: {BORDER};
 }}
 
 /* ============ Recent files strip ============ */

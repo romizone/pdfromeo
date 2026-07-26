@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from app.engine import EngineError, PdfEngine
 
 from .home import HomeView
-from .tool_registry import TOOL_NEEDS_DOC
+from .tool_registry import TOOL_NEEDS_DOC, tool_available, missing_dep_message
 
 
 # Recent files: persist last 5 in ~/Library/Application Support/PdfRomeo/
@@ -389,6 +389,15 @@ class MainWindow(QMainWindow):
         cls = TOOL_REGISTRY.get(tool_id)
         if cls is None:
             self._status.setText(f"Unknown tool: {tool_id}")
+            return
+
+        # Block tools whose system dependencies are missing.
+        if not tool_available(tool_id):
+            QMessageBox.warning(
+                self, "Tool unavailable",
+                missing_dep_message(tool_id) or
+                "This tool is not available on this system.",
+            )
             return
 
         if TOOL_NEEDS_DOC.get(tool_id, True) and not self._current_path:

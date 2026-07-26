@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from app.ui.tool_registry import TOOL_NEEDS_DOC
+from app.ui.tool_registry import TOOL_NEEDS_DOC, tool_available, missing_dep_message
 
 
 @dataclass
@@ -281,7 +281,8 @@ class HomeView(QWidget):
         self._current_path = path
         for tool_id, card in self._cards.items():
             needs_doc = TOOL_NEEDS_DOC.get(tool_id, True)
-            disabled = needs_doc and not path
+            sys_unavailable = not tool_available(tool_id)
+            disabled = (needs_doc and not path) or sys_unavailable
             card.setProperty("disabled", disabled)
             # remove the property when not disabled, to fall back to default
             if not disabled:
@@ -292,6 +293,12 @@ class HomeView(QWidget):
                 Qt.CursorShape.PointingHandCursor if not disabled
                 else Qt.CursorShape.ForbiddenCursor
             )
+            if sys_unavailable:
+                card.setToolTip(missing_dep_message(tool_id))
+            elif needs_doc and not path:
+                card.setToolTip("Open a PDF first to use this tool.")
+            else:
+                card.setToolTip("")
 
     def filter_text(self) -> str:
         return self.search.text()
