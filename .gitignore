@@ -1,0 +1,47 @@
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+
+# --- Virtual environments -------------------------------------------------
+.venv/
+.venv2/
+venv/
+env/
+ENV/
+
+# --- Build / dist (py2app output) -----------------------------------------
+build/
+dist/
+*.dmg
+*.app/
+
+# --- PySide6 / Qt ---------------------------------------------------------
+*.qmlc
+*.jsc
+
+# --- IDE / editor ---------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Project-specific runtime --------------------------------------------
+resources/screenshot*.png
+resources/preview_*.png
+/tmp/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- Test artifacts -------------------------------------------------------
+tests/_tmp/
+tests/_artifacts/
