@@ -1,5 +1,52 @@
 # Changelog
 
+## 2.2.0
+
+The paragraph you edit can now grow. When a re-wrapped paragraph needs more
+lines than it had, everything below it on the page moves down to make room —
+and when it needs fewer, the space closes up again.
+
+### Making room
+
+- **Grow down.** Add a sentence and the paragraph takes the lines it needs;
+  the text, bullets, tables, images, links and form fields below it shift by
+  exactly that much. Everything above stays where it was.
+- **Shrink up.** Delete a sentence and the content below moves back up by
+  exactly the height released.
+- **Column-aware.** On a two-column page only the edited column moves; the
+  other one is untouched. A full-width shift would have dragged it along and
+  sliced any line crossing the boundary in half.
+- **Annotations come along.** Highlights, notes and shapes below the edit
+  move with the words they mark. PyMuPDF's own `set_rect` silently refuses
+  to move a highlight — it reports the failure to a console nobody sees — so
+  their quad points are rewritten directly.
+- **It stops honestly.** Content pushed past the bottom of a page is
+  discarded by PDF without warning, so an edit that would do that is
+  refused, naming the paragraph and how much more room it needs. Nothing is
+  written. There is no flow onto the next page; PDF has no page-flow model
+  and neither does Acrobat.
+
+### Editing the same page twice
+
+Each page keeps its original content plus an ordered log of the paragraphs
+you have edited. Every edit rebuilds the page from that original and replays
+the whole log. Without this, editing a second paragraph would have quietly
+reverted the first one to its original wording — the page has to be rebuilt
+from scratch each time, because shifts otherwise accumulate phantom geometry
+that no cleaning API removes.
+
+### Safety
+
+The guard from 2.1 now understands movement: every word outside the edited
+paragraph must keep its text *and* land exactly where its own band says it
+should, within 0.05 pt. A word that changed, vanished, or moved by an
+unexpected amount rolls the entire edit back. Band boundaries are snapped to
+gaps no line crosses — on a tightly set page, 95 of 120 candidate boundaries
+would have cut through a line of text.
+
+New module: `app/engine/pageroom.py` (free-space detection and banded page
+shifting). `tests/test_reflow.py` grows from 151 to 256 checks.
+
 ## 2.1.0
 
 Editing text stops being "replace this fragment" and becomes "retype this

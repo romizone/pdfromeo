@@ -33,10 +33,12 @@ native-feeling desktop app. Built with PySide6,
 ### ✍️ Edit text with reflow
 - **Double-click a paragraph and retype it** — the whole paragraph re-wraps
 - Keeps the document's **own font**, its justification, and inline bold/italic
+- **Content below moves to make room** when the paragraph grows, and closes
+  back up when it shrinks — including bullets, tables, images, links, form
+  fields and annotations. On a two-column page only that column moves
 - Declines with a plain reason where re-wrapping would do damage (tables,
-  contents pages, rotated or multi-column pages, OCR layers)
-- Never moves the rest of the page: an edit that needs more room is refused
-  rather than written
+  contents pages, rotated or multi-column pages, OCR layers), and refuses
+  rather than pushing content off the bottom of the page
 
 ### 💬 Comment & review
 - **Highlight, Underline, Strikethrough, Squiggly** on selected text
@@ -223,6 +225,7 @@ PdfRomeo/
 │   │   ├── fontmetrics.py   # exact text measurement from the PDF itself
 │   │   ├── textblocks.py    # paragraph reconstruction + safety gate
 │   │   ├── reflow.py        # line breaking + content-stream emission
+│   │   ├── pageroom.py      # free space + banded page shifting
 │   │   └── convert.py       # PDF ↔ Word/Excel/PPT/JPG/HTML
 │   ├── workers/             # background QThread workers
 │   └── ui/

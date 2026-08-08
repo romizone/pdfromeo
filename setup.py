@@ -137,6 +137,7 @@ OPTIONS = {
         "app.engine", "app.engine.pdf_engine", "app.engine.convert",
         "app.engine.session", "app.engine.fontmetrics",
         "app.engine.textblocks", "app.engine.reflow",
+        "app.engine.pageroom",
         "app.workers", "app.workers.background",
         "app", "app.deps",
         "app.ui", "app.ui.main_window",

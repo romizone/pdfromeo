@@ -1,4 +1,4 @@
-"""Tests for paragraph reflow — spec §11, Phase A.
+"""Tests for paragraph reflow — spec §11, Phases A and B.
 
 Why this file is shaped the way it is: the reflow spec was rewritten after an
 adversarial critique returned *needs-rework* on the first draft, and most of
@@ -24,6 +24,34 @@ path:
   forced to fire twice — once by sabotaging the layer under the session and
   once by sabotaging the redaction inside it — and each time the document must
   come back byte-for-byte with no undo step left behind.
+
+Phase B (``allow_push=True``) moves content, so its tests are weighted
+differently again. Its failure mode is a rendered page that looks plausible and
+is wrong, and three of the four ways that happens were reproduced by the
+critics rather than imagined:
+
+* **Two paragraphs, one page.** Re-deriving each edit from a pristine page
+  while applying only an accumulated ``dy`` throws the earlier edit away
+  silently — paragraph 3 reverted to its original wording after paragraph 7 was
+  edited. ``test_phase_b_two_paragraphs`` asserts both new strings are present
+  and neither original is; nothing else catches that.
+* **The displayed page is not the pristine page.** After one push the shifted
+  page re-numbers its own paragraphs, so a key read off it points at the wrong
+  paragraph. ``test_phase_b_pristine_keys`` clicks where the user would and
+  checks the key that comes back is the one the paragraph had before anything
+  moved.
+* **Content shifted past the page edge is silently lost** — a footer vanished
+  and the page's extracted text went from 653 to 613 characters with no error —
+  so ``test_phase_b_refusal`` demands a refusal with nothing written rather
+  than a best effort.
+* **Phantom geometry compounds** 11 -> 22 -> 44 -> ... over stacked edits, so
+  ``test_phase_b_no_stacking`` runs five pushes and requires both a constant
+  drawing count AND all five edits still on the page: either alone passes for
+  the wrong reason.
+
+Every Phase B position check is exact to 0.05 pt. The band re-stamp reproduced
+a shifted page's words at their expected coordinates to within float32 printing
+noise, so a looser budget here would only hide arithmetic.
 
 Every verification re-opens the document through ``extract_pages`` rather than
 reading the live one: ``get_pixmap``/``get_text`` may serve a stale display
@@ -262,6 +290,81 @@ def toc_pdf(path: str) -> None:
     doc.close()
 
 
+SECTIONS = ("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot")
+
+#: Appended to a section to make it exactly one line longer. Phase B's whole
+#: subject is what happens to the rest of the page when that line appears.
+ONE_MORE_LINE = (" The board has asked for a further update on this section "
+                 "before the end of the current year.")
+
+
+def section_text(name: str) -> str:
+    return (f"Section {name} of the interim report sets out how that division "
+            f"performed over the period under review, what the board now "
+            f"expects for the remainder of the year, and which assumptions "
+            f"underpin the {name} view.")
+
+
+def sections_pdf(path: str) -> None:
+    """Six reflowable paragraphs, a rule and a footer, on one page.
+
+    The five-successive-pushes test needs five DIFFERENT paragraphs: five edits
+    to the same one would pass the no-stacking check while proving nothing about
+    the replay log, because only the last one would ever have to survive.
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    regular = fitz.Font(fontfile=GEORGIA)
+    space = regular.text_length(" ", SIZE)
+    writer = fitz.TextWriter(page.rect)
+    y = TOP
+    for name in SECTIONS:
+        lines = _wrap(_tokens([(section_text(name), 0)], (regular, regular)),
+                      SIZE, WIDTH, space)
+        y = _write_paragraph(writer, lines, y) + 24.0
+    writer.append((LEFT, 800), "Northwind Holdings interim report",
+                  font=regular, fontsize=8)
+    writer.write_text(page, color=(0.0, 0.0, 0.0))
+    shape = page.new_shape()
+    shape.draw_line(fitz.Point(56, 118), fitz.Point(456, 118))
+    shape.finish(width=1.0, color=(0.2, 0.3, 0.5))
+    shape.commit()
+    doc.save(path)
+    doc.close()
+
+
+def annotated_pdf(path: str) -> None:
+    """``report_pdf`` plus everything a shift has to carry with the text.
+
+    A highlight ON the body paragraph (which §7.4 must delete and count), a
+    highlight, a link and a form field BELOW it (which must all move by exactly
+    the growth), and the footer (which must not move at all). Each is a
+    separate PDF mechanism: markup annotations refuse ``set_rect`` at C level
+    with no exception, widgets must not be ``update()``d or they re-lay their
+    own text, and links are not annotations at all.
+    """
+    report_pdf(path)
+    doc = fitz.open(path)
+    page = doc[0]
+    on_top = page.add_highlight_annot(fitz.Rect(56, 124, 200, 136))
+    on_top.set_info(content="marks the paragraph itself")
+    on_top.update()
+    below = page.add_highlight_annot(fitz.Rect(56, 208, 200, 220))
+    below.set_info(content="marks the paragraph below")
+    below.update()
+    page.insert_link({"kind": fitz.LINK_URI, "uri": "https://example.com/",
+                      "from": fitz.Rect(60, 420, 200, 434)})
+    widget = fitz.Widget()
+    widget.rect = fitz.Rect(60, 450, 200, 470)
+    widget.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+    widget.field_name = "reviewer"
+    widget.field_value = "J. Smith"
+    widget.text_fontsize = 10
+    page.add_widget(widget)
+    doc.saveIncr()
+    doc.close()
+
+
 def two_column_pdf(path: str) -> None:
     doc = fitz.open()
     page = doc.new_page(width=595, height=842)
@@ -400,6 +503,68 @@ def retext(para, text: str) -> list:
 
 def font_table(page: "fitz.Page") -> set[tuple[str, str]]:
     return {(entry[4], entry[3]) for entry in page.get_fonts(full=True)}
+
+
+# --- Phase B: did the rest of the page move by exactly what it should? -----
+
+#: The band re-stamp put every word of a shifted page within float32 printing
+#: noise of where the arithmetic said it should be (measured: identical to
+#: 0.01 pt), so anything looser than this would hide a mis-planned band.
+SHIFT_TOLERANCE = 0.05
+
+
+def band_report(before: list[tuple], after: list[tuple], *,
+                pristine_zone, final_zone, band_top: float, band_end: float,
+                dy: float) -> str:
+    """"" when every word outside the paragraph moved by exactly its own dy.
+
+    This is the Phase A invariant adapted, not relaxed: words below the edit are
+    now SUPPOSED to move, so each one is checked against the position its own
+    band prescribes rather than against standing still. Words above the
+    paragraph, and the footer below the band, must not move at all — and they
+    are checked by the same arithmetic with dy = 0, so "the footer never moves"
+    is a measurement here rather than a separate hope.
+    """
+    _inside, before_out = split_words(before, pristine_zone)
+    _inside, after_out = split_words(after, final_zone)
+    want = sorted((w[4], round(w[0], 2),
+                   round(w[1] + (dy if band_top <= w[1] <= band_end else 0.0), 2))
+                  for w in before_out)
+    got = sorted((w[4], round(w[0], 2), round(w[1], 2)) for w in after_out)
+    if len(want) != len(got):
+        lost = sorted({w[0] for w in want} - {w[0] for w in got})
+        extra = sorted({w[0] for w in got} - {w[0] for w in want})
+        return (f"{len(want)} words expected, {len(got)} found; "
+                f"missing {lost[:4]}, unexpected {extra[:4]}")
+    for (text, x, y), (other, gx, gy) in zip(want, got):
+        if text != other:
+            return f"expected “{text}” where “{other}” is"
+        if abs(gx - x) > SHIFT_TOLERANCE or abs(gy - y) > SHIFT_TOLERANCE:
+            return (f"“{text}” expected at ({x:.2f}, {y:.2f}) but found at "
+                    f"({gx:.2f}, {gy:.2f})")
+    return ""
+
+
+def zones_of(para, dy_above: float, growth: float):
+    """(pristine zone, displayed zone) of an edited paragraph, padded."""
+    box = para.bbox
+    pad = (-1.0, -1.0, 1.0, 1.0)
+    pristine = fitz.Rect(box) + pad
+    final = fitz.Rect(box[0], box[1] + dy_above,
+                      box[2], box[3] + dy_above + growth) + pad
+    return pristine, final
+
+
+def trailerless(path: str) -> bytes:
+    """The file without its trailer, whose /ID is random on every save.
+
+    Two identical saves of an identical document differ in exactly 61 bytes,
+    all of them inside ``/ID[<…><…>]``, so comparing whole files would make
+    "the second edit produces the same bytes" untestable for the wrong reason.
+    """
+    data = Path(path).read_bytes()
+    cut = data.rfind(b"trailer")
+    return data if cut < 0 else data[:cut]
 
 
 # ---------------------------------------------------------------------------
@@ -839,14 +1004,17 @@ def test_argument_contract(tmp: Path) -> None:
             "new_runs == [] is rejected with the §7.3 wording",
             lambda: s.reflow_paragraph(0, body.key, []),
             "A paragraph cannot be emptied — leave at least one space")
-        expect_error("allow_push is refused in Phase A",
-                     lambda: s.reflow_paragraph(0, body.key, body.runs,
+        # Phase B ships, so these two flags no longer refuse — but they must
+        # still be held to every argument rule the plain call is, since a push
+        # is the one route that can damage the page rather than decline.
+        expect_error("allow_push still rejects an emptied paragraph",
+                     lambda: s.reflow_paragraph(0, body.key, [],
                                                 allow_push=True),
-                     "not available in this version")
-        expect_error("allow_shrink is refused in Phase A",
-                     lambda: s.reflow_paragraph(0, body.key, body.runs,
-                                                allow_shrink=True),
-                     "not available in this version")
+                     "A paragraph cannot be emptied — leave at least one space")
+        expect_error("allow_push still range-checks the page",
+                     lambda: s.reflow_paragraph(7, body.key, body.runs,
+                                                allow_push=True),
+                     "out of range")
         expect_error("an out-of-range page is refused",
                      lambda: s.reflow_paragraph(7, body.key, body.runs),
                      "out of range")
@@ -1133,8 +1301,643 @@ def test_word_per_span_keeps_spaces(tmp: Path) -> None:
         session.close()
 
 
+# ---------------------------------------------------------------------------
+# Phase B — grow down, shrink up (spec §7)
+# ---------------------------------------------------------------------------
+
+def _push_case(tmp: Path, label: str, replacement, *, expect_growth: str) -> None:
+    """Edit the body paragraph with a push and check the whole page arithmetic."""
+    src = str(tmp / f"push_{label}.pdf")
+    report_pdf(src)
+    s = DocumentSession(src)
+    try:
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        footer = find_para(s.paragraphs(0), "Northwind Holdings")
+        with saved(s, str(tmp / f"push_{label}_before.pdf")) as doc:
+            before = words_of(doc[0])
+            before_drawings = len(doc[0].get_drawings())
+
+        text = replacement(flat(body.text))
+        result = s.reflow_paragraph(0, body.key, retext(body, text),
+                                    allow_push=True)
+        check(f"{label}: the push is accepted", result.ok, result.message)
+        if not result.ok:
+            return
+        if expect_growth == "down":
+            check(f"{label}: the paragraph grew", result.grew_by > 0.0,
+                  f"{result.grew_by}")
+        else:
+            check(f"{label}: the paragraph shrank", result.grew_by < 0.0,
+                  f"{result.grew_by}")
+        check(f"{label}: pushed is signed and equals the growth",
+              abs(result.pushed - result.grew_by) < 0.01,
+              f"pushed={result.pushed} grew_by={result.grew_by}")
+
+        pristine_zone, final_zone = zones_of(body, 0.0, result.grew_by)
+        with saved(s, str(tmp / f"push_{label}_after.pdf")) as doc:
+            page = doc[0]
+            detail = band_report(
+                before, words_of(page),
+                pristine_zone=pristine_zone, final_zone=final_zone,
+                band_top=body.bbox[3], band_end=footer.bbox[1] - 1.0,
+                dy=result.grew_by)
+            check(f"{label}: every word below moved by exactly "
+                  f"{result.grew_by:.1f} pt and nothing else moved at all",
+                  detail == "", detail)
+            text_now = flat(page.get_text())
+            check(f"{label}: the new text is on the page",
+                  flat(text)[:60] in text_now, text_now[:120])
+            check(f"{label}: the footer never moved",
+                  "Northwind Holdings interim report" in text_now)
+            check(f"{label}: the rule line was not duplicated",
+                  len(page.get_drawings()) >= before_drawings,
+                  f"{before_drawings} -> {len(page.get_drawings())}")
+    finally:
+        s.close()
+
+
+def test_phase_b_growth(tmp: Path) -> None:
+    _push_case(tmp, "growth",
+               lambda old: old + " The committee also asked management to "
+                                 "publish a further update before the end of "
+                                 "the current financial year.",
+               expect_growth="down")
+
+
+def test_phase_b_deletion(tmp: Path) -> None:
+    """Deletion is as common as insertion, and runs the same machinery upwards."""
+    _push_case(tmp, "deletion",
+               lambda old: "The board reviewed the results for the quarter and "
+                           "concluded that the revenue trajectory remains "
+                           "intact.",
+               expect_growth="up")
+
+
+def test_phase_b_two_paragraphs(tmp: Path) -> None:
+    """Edit A, then edit B: BOTH must survive. The replay-bug test.
+
+    A pristine re-derive that applies only an accumulated dy passes every other
+    Phase B check and silently reverts A when B is edited.
+    """
+    src = str(tmp / "b_twopara.pdf")
+    report_pdf(src)
+    s = DocumentSession(src)
+    try:
+        first = find_para(s.paragraphs(0), "The board reviewed")
+        second = find_para(s.paragraphs(0), "Headcount was broadly")
+        alpha = ("ALPHA has replaced the first paragraph entirely, and it runs "
+                 "on for long enough to need more lines than the text it "
+                 "replaced, which is the whole point of this test: the second "
+                 "edit has to be laid out against a page the first one has "
+                 "already moved, and the first one has to still be there when "
+                 "the second is finished with it. Nothing else on the page may "
+                 "move by anything other than the exact height these two "
+                 "paragraphs gained between them.")
+        result = s.reflow_paragraph(0, first.key, retext(first, alpha),
+                                    allow_push=True)
+        check("editing the first paragraph with a push succeeds", result.ok,
+              result.message)
+        check("the first edit grew the paragraph", result.grew_by > 0.0,
+              f"{result.grew_by}")
+
+        bravo = ("BRAVO has replaced the second paragraph and is also somewhat "
+                 "longer than the text that used to be here in its place.")
+        # The PRISTINE key, captured before anything moved — which is the whole
+        # contract. The displayed page has re-numbered its paragraphs by now.
+        result = s.reflow_paragraph(0, second.key, retext(second, bravo),
+                                    allow_push=True)
+        check("editing the second paragraph with a push succeeds", result.ok,
+              result.message)
+
+        with saved(s, str(tmp / "b_twopara_after.pdf")) as doc:
+            page_text = flat(doc[0].get_text())
+            check("the first edit survived the second",
+                  "ALPHA has replaced the first paragraph" in page_text,
+                  page_text[:200])
+            check("the second edit landed",
+                  "BRAVO has replaced the second paragraph" in page_text,
+                  page_text[:200])
+            check("neither original paragraph remains",
+                  "The board reviewed" not in page_text
+                  and "Headcount was broadly" not in page_text,
+                  page_text[:200])
+            check("the footer is still there after two pushes",
+                  "Northwind Holdings interim report" in page_text,
+                  page_text[-120:])
+
+        # A third edit, keyed by a Paragraph read off the DISPLAYED page. Its
+        # ordinal is the shifted page's, not the pristine one, and its text is
+        # what the second edit put there — so neither the ordinal nor a
+        # comparison against pristine can identify it, and following the
+        # ordinal blindly would rewrite whichever paragraph holds it on the
+        # pristine page. The object has to identify itself through the log.
+        displayed = find_para(s.paragraphs(0), "BRAVO has replaced")
+        result = s.reflow_paragraph(
+            0, displayed,
+            retext(displayed, "DELTA replaced BRAVO on the shifted page."),
+            allow_push=True)
+        check("a Paragraph read off the SHIFTED page still edits itself",
+              result.ok, result.message)
+        with saved(s, str(tmp / "b_twopara_third.pdf")) as doc:
+            page_text = flat(doc[0].get_text())
+            check("the third edit replaced the paragraph it was read from",
+                  "DELTA replaced BRAVO on the shifted page." in page_text
+                  and "BRAVO has replaced" not in page_text, page_text[:200])
+            check("the first edit is STILL there after the third",
+                  "ALPHA has replaced the first paragraph" in page_text,
+                  page_text[:200])
+    finally:
+        s.close()
+
+
+def test_phase_b_pristine_keys(tmp: Path) -> None:
+    """The user clicks the shifted page; the key must come back pristine."""
+    src = str(tmp / "b_keys.pdf")
+    report_pdf(src)
+    s = DocumentSession(src)
+    try:
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        neighbour = find_para(s.paragraphs(0), "Headcount was broadly")
+        result = s.reflow_paragraph(
+            0, body.key,
+            retext(body, flat(body.text) + " The committee also asked for a "
+                         "further update before the end of the year."),
+            allow_push=True)
+        check("the paragraph above grew", result.ok and result.grew_by > 0.0,
+              result.message)
+        dy = result.grew_by
+
+        # Where the neighbour is NOW, which is the only place the user can click.
+        hit = s.paragraph_at(0, neighbour.bbox_display[0] + 4.0,
+                             neighbour.bbox_display[1] + dy + 4.0)
+        check("a click on the shifted page finds a paragraph", hit is not None)
+        if hit is None:
+            return
+        check("paragraph_at returns the PRISTINE key, not the displayed one",
+              hit.key == neighbour.key, f"{hit.key} != {neighbour.key}")
+        check("the returned paragraph keeps its pristine bbox",
+              max(abs(a - b) for a, b in zip(hit.bbox, neighbour.bbox)) < 0.01,
+              f"{hit.bbox} != {neighbour.bbox}")
+        check("but its DISPLAYED box is where the user sees it",
+              abs(hit.bbox_display[1] - (neighbour.bbox_display[1] + dy)) < 0.05,
+              f"{hit.bbox_display[1]} != {neighbour.bbox_display[1] + dy}")
+
+        # An in-place edit after a push must still work: the Paragraph the UI
+        # is holding is keyed on pristine, and the page it is about to be
+        # resolved against is the shifted one.
+        in_place = s.reflow_paragraph(0, hit, retext(hit, flat(hit.text)))
+        check("an in-place edit still resolves a pristine-keyed Paragraph "
+              "after a push", in_place.ok, in_place.message)
+        if in_place.ok:
+            s.undo()
+            hit = s.paragraph_at(0, neighbour.bbox_display[0] + 4.0,
+                                 neighbour.bbox_display[1] + dy + 4.0)
+
+        # And the key really does edit the paragraph that was clicked.
+        result = s.reflow_paragraph(
+            0, hit.key, retext(hit, "CHARLIE replaced the clicked paragraph."),
+            allow_push=True)
+        check("editing through the mapped key succeeds", result.ok,
+              result.message)
+        with saved(s, str(tmp / "b_keys_after.pdf")) as doc:
+            page_text = flat(doc[0].get_text())
+            check("the clicked paragraph is the one that changed",
+                  "CHARLIE replaced the clicked paragraph." in page_text
+                  and "Headcount was broadly" not in page_text,
+                  page_text[:200])
+            check("the paragraph above was not touched by the second edit",
+                  "The committee also asked for a further update" in page_text,
+                  page_text[:200])
+    finally:
+        s.close()
+
+
+def test_phase_b_annotations(tmp: Path) -> None:
+    """§7.4: the marks below follow the text; the mark on it is dropped."""
+    src = str(tmp / "b_annots.pdf")
+    annotated_pdf(src)
+    s = DocumentSession(src)
+    try:
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        with saved(s, str(tmp / "b_annots_before.pdf")) as doc:
+            page = doc[0]
+            before_annots = {a.info.get("content", ""): fitz.Rect(a.rect)
+                             for a in page.annots()}
+            before_link = fitz.Rect(page.get_links()[0]["from"])
+            before_widget = next(iter(page.widgets()))
+            before_widget = (before_widget.field_name,
+                             fitz.Rect(before_widget.rect),
+                             before_widget.field_value)
+        check("the fixture starts with two comments, a link and a field",
+              len(before_annots) == 2 and before_widget[0] == "reviewer",
+              f"{sorted(before_annots)} {before_widget}")
+
+        result = s.reflow_paragraph(
+            0, body.key,
+            retext(body, flat(body.text) + " The committee also asked for a "
+                         "further update before the end of the year."),
+            allow_push=True)
+        check("a paragraph carrying a highlight can still be pushed",
+              result.ok, result.message)
+        if not result.ok:
+            return
+        check("the dropped comment is counted in the message",
+              "1 comment" in result.message and "removed" in result.message,
+              result.message)
+        dy = result.grew_by
+
+        with saved(s, str(tmp / "b_annots_after.pdf")) as doc:
+            page = doc[0]
+            annots = {a.info.get("content", ""): fitz.Rect(a.rect)
+                      for a in page.annots()}
+            check("the highlight ON the edited paragraph was deleted",
+                  "marks the paragraph itself" not in annots,
+                  f"{sorted(annots)}")
+            moved = annots.get("marks the paragraph below")
+            want = before_annots["marks the paragraph below"].y0 + dy
+            check("the highlight BELOW moved with the text it marks",
+                  moved is not None and abs(moved.y0 - want) < SHIFT_TOLERANCE,
+                  f"{moved.y0 if moved else None} != {want}")
+
+            links = page.get_links()
+            check("the link below the paragraph survived and was repositioned",
+                  len(links) == 1
+                  and abs(fitz.Rect(links[0]["from"]).y0
+                          - (before_link.y0 + dy)) < SHIFT_TOLERANCE
+                  and links[0].get("uri") == "https://example.com/",
+                  f"{links}")
+
+            widgets = list(page.widgets())
+            check("the form field survived, moved, and kept its value",
+                  len(widgets) == 1
+                  and widgets[0].field_name == "reviewer"
+                  and widgets[0].field_value == "J. Smith"
+                  and abs(fitz.Rect(widgets[0].rect).y0
+                          - (before_widget[1].y0 + dy)) < SHIFT_TOLERANCE,
+                  f"{[(w.field_name, w.rect, w.field_value) for w in widgets]}")
+            check("the footer did not move with them",
+                  "Northwind Holdings interim report" in flat(page.get_text()))
+    finally:
+        s.close()
+
+
+def test_phase_b_refusal(tmp: Path) -> None:
+    """Too long even with a push: refuse, name it, and write nothing."""
+    src = str(tmp / "b_refuse.pdf")
+    report_pdf(src)
+    s = DocumentSession(src)
+    try:
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        with saved(s, str(tmp / "b_refuse_before.pdf")) as doc:
+            before = words_of(doc[0])
+        huge = " ".join([flat(body.text)] * 14)
+        result = s.reflow_paragraph(0, body.key, retext(body, huge),
+                                    allow_push=True)
+        check("text too long even to push is refused", not result.ok,
+              result.message)
+        check("the refusal names the paragraph and the room it needs",
+              "The board reviewed" in result.message
+              and "more room" in result.message
+              and "extra line" in result.message, result.message)
+        check("a push refusal leaves no undo step and no modification",
+              not s.can_undo() and not s.is_modified(),
+              f"undo={s.can_undo()} modified={s.is_modified()}")
+        with saved(s, str(tmp / "b_refuse_after.pdf")) as doc:
+            check("a push refusal writes NOTHING", words_of(doc[0]) == before)
+
+        # And the session is still usable afterwards.
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        result = s.reflow_paragraph(
+            0, body.key, retext(body, flat(body.text) + " One more sentence."),
+            allow_push=True)
+        check("a normal push still works after a refused one", result.ok,
+              result.message)
+    finally:
+        s.close()
+
+    # A push must honour the §8 gate before it honours the request. Rotated
+    # pages are the case where getting it wrong is worst: the band shift maps
+    # content through a matrix that would put it somewhere else entirely.
+    for label, build in (("/Rotate 90", lambda p: report_pdf(p, rotate=90)),
+                         ("two columns", two_column_pdf),
+                         ("a dot-leader TOC", toc_pdf)):
+        src = str(tmp / f"b_gate_{abs(hash(label)) % 9999}.pdf")
+        build(src)
+        s = DocumentSession(src)
+        try:
+            with saved(s, str(tmp / "b_gate_before.pdf")) as doc:
+                before = words_of(doc[0])
+            para = s.paragraphs(0)[0]
+            result = s.reflow_paragraph(
+                0, para.key, retext(para, flat(para.text) + " Plus more words "
+                                    "to make this paragraph grow a line."),
+                allow_push=True)
+            check(f"a push on {label} is refused by the gate, not attempted",
+                  not result.ok and bool(result.message), result.message)
+            check(f"a push on {label} leaves no undo step",
+                  not s.can_undo() and not s.is_modified(),
+                  f"undo={s.can_undo()} modified={s.is_modified()}")
+            with saved(s, str(tmp / "b_gate_after.pdf")) as doc:
+                check(f"a push on {label} writes nothing at all",
+                      words_of(doc[0]) == before)
+        finally:
+            s.close()
+
+
+def test_phase_b_shrink(tmp: Path) -> None:
+    """§7.5: 3% closes a last-line gap and is never offered a whole line."""
+    src = str(tmp / "b_shrink.pdf")
+    report_pdf(src)
+    s = DocumentSession(src)
+    try:
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        spill = flat(body.text) + " one two three four five six seven"
+        plain = s.reflow_paragraph(0, body.key, retext(body, spill))
+        check("a line too much is refused without allow_shrink", not plain.ok,
+              plain.message)
+        check("nothing was written by the refusal", not s.can_undo())
+
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        shrunk = s.reflow_paragraph(0, body.key, retext(body, spill),
+                                    allow_shrink=True)
+        check("allow_shrink closes the last-line gap", shrunk.ok,
+              shrunk.message)
+        check("the shrink is capped at 3%",
+              0.0 < shrunk.shrunk_pct <= 0.03, f"{shrunk.shrunk_pct}")
+        check("the shrink kept the original line count",
+              shrunk.lines == body.line_count,
+              f"{shrunk.lines} != {body.line_count}")
+        check("the message says the type was reduced",
+              "reduced by" in shrunk.message, shrunk.message)
+        with saved(s, str(tmp / "b_shrink_after.pdf")) as doc:
+            page_text = flat(doc[0].get_text())
+            check("the spilled words are on the page",
+                  "one two three four five six seven" in page_text,
+                  page_text[:160])
+        s.undo()
+
+        # A whole line of overflow is NOT what shrink is for.
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        with saved(s, str(tmp / "b_shrink_undone.pdf")) as doc:
+            undone = words_of(doc[0])
+        steps = len(s._undo)
+        too_much = " ".join([flat(body.text)] * 2)
+        result = s.reflow_paragraph(0, body.key, retext(body, too_much),
+                                    allow_shrink=True)
+        check("allow_shrink never absorbs a whole line", not result.ok,
+              result.message)
+        # is_modified() stays True after any undo by design, so the honest
+        # question is whether this call added a step or changed a glyph.
+        check("that refusal wrote nothing either", len(s._undo) == steps,
+              f"{steps} -> {len(s._undo)} undo steps")
+        with saved(s, str(tmp / "b_shrink_refused.pdf")) as doc:
+            check("the page is untouched after the shrink refusal",
+                  words_of(doc[0]) == undone)
+    finally:
+        s.close()
+
+
+def test_phase_b_no_stacking(tmp: Path) -> None:
+    """Five pushes: no compounding AND all five edits survive.
+
+    Two scenarios, because neither half of the requirement can be measured on
+    the other's. Editing ONE paragraph five times is where "the drawing count
+    stays constant" means something — and it is also where a naive pristine
+    re-derive passes for exactly the wrong reason, since only the last edit ever
+    has to survive. Editing FIVE paragraphs is where "all five edits are still
+    there" means something, and there the count grows by exactly one clip
+    rectangle per band (measured 3, 4, 5, 6, 7 for one to five bands), which is
+    the re-stamp's own tiling and not the 11 -> 22 -> 44 -> ... -> 704
+    compounding this test exists to catch.
+    """
+    src = str(tmp / "b_stack_same.pdf")
+    sections_pdf(src)
+    s = DocumentSession(src)
+    try:
+        key = find_para(s.paragraphs(0), "Section Alpha").key
+        repeats, sizes = [], []
+        for round_number in range(5):
+            para = find_para(s.paragraphs(0), "Section ")
+            result = s.reflow_paragraph(
+                0, key,
+                retext(para, section_text("Alpha")
+                       + f" Round {round_number} rewrote this same paragraph "
+                         "again, to see what accumulates underneath it."),
+                allow_push=True)
+            check(f"re-push {round_number + 1} of 5 on one paragraph succeeds",
+                  result.ok, result.message)
+            dest = str(tmp / f"b_stack_same_{round_number}.pdf")
+            with saved(s, dest) as doc:
+                repeats.append(len(doc[0].get_drawings()))
+                last_text = flat(doc[0].get_text())
+            sizes.append(os.path.getsize(dest))
+        check("re-editing one paragraph keeps the drawing count constant",
+              len(set(repeats)) == 1, f"{repeats}")
+        check("re-editing one paragraph keeps the file size constant",
+              max(sizes) - min(sizes) < 4096, f"{sizes}")
+        check("only the last of five edits to one paragraph is on the page",
+              "Round 4 rewrote this same paragraph" in last_text
+              and "Round 3 rewrote this same paragraph" not in last_text,
+              last_text[:200])
+    finally:
+        s.close()
+
+    src = str(tmp / "b_stack.pdf")
+    sections_pdf(src)
+    s = DocumentSession(src)
+    try:
+        paras = s.paragraphs(0)
+        check("the fixture has six sections and a footer", len(paras) == 7,
+              f"{len(paras)}: {[flat(p.text)[:24] for p in paras]}")
+        keys = {}
+        for name in SECTIONS:
+            para = find_para(paras, f"Section {name} of the interim report")
+            keys[name] = para.key
+            if name == SECTIONS[0]:
+                check("a section paragraph passes the §8 gate", para.reflowable,
+                      para.reason)
+
+        drawings, sizes, texts = [], [], []
+        for round_number, name in enumerate(SECTIONS[:5]):
+            para = next(p for p in s.paragraphs(0)
+                        if p.key == keys[name] or f"Section {name} " in p.text)
+            result = s.reflow_paragraph(
+                0, keys[name],
+                retext(para, section_text(name) + ONE_MORE_LINE),
+                allow_push=True)
+            check(f"push {round_number + 1} of 5 succeeds", result.ok,
+                  result.message)
+            dest = str(tmp / f"b_stack_{round_number}.pdf")
+            with saved(s, dest) as doc:
+                drawings.append(len(doc[0].get_drawings()))
+                texts.append(flat(doc[0].get_text()))
+            sizes.append(os.path.getsize(dest))
+
+        steps = [drawings[i + 1] - drawings[i] for i in range(len(drawings) - 1)]
+        check("line art never multiplies: at most one clip per new band",
+              all(0 <= step <= 1 for step in steps)
+              and drawings[-1] <= drawings[0] + 4, f"{drawings}")
+        deltas = [sizes[i + 1] - sizes[i] for i in range(len(sizes) - 1)]
+        check("file growth per push stays bounded, not compounding",
+              all(d <= max(deltas[0], 0) * 1.2 + 4096 for d in deltas),
+              f"{sizes} deltas={deltas}")
+        final = texts[-1]
+        survivors = [name for name in SECTIONS[:5]
+                     if f"further update on this section" in final
+                     and f"Section {name} of the interim report" in final]
+        check("all five edits are still on the page after the fifth push",
+              len(survivors) == 5, f"survived: {survivors}")
+        check("every edited section carries its new sentence",
+              final.count("The board has asked for a further update") == 5,
+              f"{final.count('The board has asked for a further update')}")
+        check("the untouched sixth section is unchanged",
+              f"Section {SECTIONS[5]} of the interim report" in final
+              and "underpin the Foxtrot view." in final, final[-200:])
+        check("the footer survived five pushes",
+              "Northwind Holdings interim report" in final, final[-120:])
+    finally:
+        s.close()
+
+
+def test_phase_b_undo(tmp: Path) -> None:
+    """Undo must discard the replay log, or the next edit replays onto a ghost."""
+    src = str(tmp / "b_undo.pdf")
+    report_pdf(src)
+    s = DocumentSession(src)
+    try:
+        with saved(s, str(tmp / "b_undo_before.pdf")) as doc:
+            before = words_of(doc[0])
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        longer = (flat(body.text) + " The committee also asked management to "
+                  "publish a further update before the end of the year.")
+        result = s.reflow_paragraph(0, body.key, retext(body, longer),
+                                    allow_push=True)
+        check("the first push succeeds", result.ok, result.message)
+        first = str(tmp / "b_undo_first.pdf")
+        with saved(s, first) as doc:
+            first_words = words_of(doc[0])
+        check("one push is one undo step", s.can_undo())
+
+        s.undo()
+        check("undo empties the stack", not s.can_undo())
+        with saved(s, str(tmp / "b_undo_undone.pdf")) as doc:
+            check("undo restores the page exactly, shift and all",
+                  words_of(doc[0]) == before)
+        check("undo discarded the replay log for every page",
+              not s._reflow_pages, f"{list(s._reflow_pages)}")
+
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        result = s.reflow_paragraph(0, body.key, retext(body, longer),
+                                    allow_push=True)
+        check("the same push succeeds again after undo", result.ok,
+              result.message)
+        second = str(tmp / "b_undo_second.pdf")
+        with saved(s, second) as doc:
+            check("edit, undo, edit again lands in the same place",
+                  words_of(doc[0]) == first_words)
+        check("edit, undo, edit again produces the same bytes",
+              trailerless(second) == trailerless(first),
+              f"{len(trailerless(second))} vs {len(trailerless(first))} bytes")
+
+        # Redo restores a whole-document snapshot too, so it must discard the
+        # log for the same reason undo does.
+        s.undo()
+        check("redo is available after undoing the second push", s.can_redo())
+        s.redo()
+        check("redo after a push discards the replay log as well",
+              not s._reflow_pages, f"{list(s._reflow_pages)}")
+        with saved(s, str(tmp / "b_undo_redone.pdf")) as doc:
+            check("redo restores the pushed page exactly",
+                  words_of(doc[0]) == first_words)
+    finally:
+        s.close()
+
+
+def test_phase_b_invariant(tmp: Path) -> None:
+    """Force the adapted invariant to fire, twice, and prove it rolls back.
+
+    The Phase A rule ("nothing outside the paragraph moved") cannot be used any
+    more, so this checks the rule that replaced it: the right words, each at the
+    position its own band prescribes. A shift by the wrong dy is the failure
+    that rule exists for and no other check on this page would notice it.
+    """
+    src = str(tmp / "b_invariant.pdf")
+    report_pdf(src)
+
+    # (1) A shift that moves the page by the WRONG amount.
+    s = DocumentSession(src)
+    try:
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        with saved(s, str(tmp / "b_inv_before.pdf")) as doc:
+            before = words_of(doc[0])
+        longer = flat(body.text) + " One more sentence to make it grow a line."
+        honest = session_mod.pageroom.shift_page
+
+        def wrong_dy(doc, page, bands):
+            return honest(doc, page,
+                          [(a, b, dy * 2.0, x0, x1) for a, b, dy, x0, x1 in bands])
+
+        session_mod.pageroom.shift_page = wrong_dy
+        try:
+            expect_error(
+                "content moved by the wrong dy is refused, not written",
+                lambda: s.reflow_paragraph(0, body.key, retext(body, longer),
+                                           allow_push=True),
+                "instead of")
+        finally:
+            session_mod.pageroom.shift_page = honest
+        check("the wrong shift is rolled back completely",
+              not s.is_modified() and not s.can_undo(),
+              f"modified={s.is_modified()} undo={s.can_undo()}")
+        with saved(s, str(tmp / "b_inv_after.pdf")) as doc:
+            check("every word survives the rolled-back push",
+                  words_of(doc[0]) == before)
+        check("the replay log was discarded with the rollback",
+              not s._reflow_pages, f"{list(s._reflow_pages)}")
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        check("a normal push still works after the refusal",
+              s.reflow_paragraph(0, body.key, retext(body, longer),
+                                 allow_push=True).ok)
+    finally:
+        s.close()
+
+    # (2) A replay that quietly loses a neighbouring paragraph.
+    s = DocumentSession(src)
+    try:
+        body = find_para(s.paragraphs(0), "The board reviewed")
+        neighbour = find_para(s.paragraphs(0), "Headcount was broadly")
+        with saved(s, str(tmp / "b_inv2_before.pdf")) as doc:
+            before = words_of(doc[0])
+
+        def sabotage(doc, page, para, new_runs, **kwargs):
+            page.add_redact_annot(fitz.Rect(neighbour.bbox))
+            page.apply_redactions(images=0, graphics=0, text=0)
+            return ReflowResult(ok=True, lines=len(para.lines), grew_by=0.0)
+
+        original = session_mod.reflow_in_place
+        session_mod.reflow_in_place = sabotage
+        try:
+            expect_error(
+                "a push that loses text elsewhere is refused, not written",
+                lambda: s.reflow_paragraph(
+                    0, body.key,
+                    retext(body, flat(body.text) + " One more sentence here."),
+                    allow_push=True),
+                "page 1")
+        finally:
+            session_mod.reflow_in_place = original
+        check("the lost-text push is rolled back completely",
+              not s.is_modified() and not s.can_undo(),
+              f"modified={s.is_modified()} undo={s.can_undo()}")
+        with saved(s, str(tmp / "b_inv2_after.pdf")) as doc:
+            check("the neighbouring paragraph is intact after the rollback",
+                  words_of(doc[0]) == before)
+    finally:
+        s.close()
+
+
 def main() -> int:
-    print("Paragraph reflow tests (spec §11, Phase A)")
+    print("Paragraph reflow tests (spec §11, Phases A and B)")
     missing = [f for f in (GEORGIA, GEORGIA_BOLD, ARIAL) if not os.path.exists(f)]
     if missing:
         print(f"  FAIL  fixture fonts are missing: {missing}")
@@ -1157,6 +1960,16 @@ def main() -> int:
             test_no_stacking,
             test_two_paragraphs_one_page,
             test_word_per_span_keeps_spaces,
+            test_phase_b_growth,
+            test_phase_b_deletion,
+            test_phase_b_two_paragraphs,
+            test_phase_b_pristine_keys,
+            test_phase_b_annotations,
+            test_phase_b_refusal,
+            test_phase_b_shrink,
+            test_phase_b_no_stacking,
+            test_phase_b_undo,
+            test_phase_b_invariant,
         ):
             print(f"— {fn.__name__}")
             try:
