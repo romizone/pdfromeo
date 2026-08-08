@@ -1,5 +1,96 @@
 # Changelog
 
+## 2.0.0
+
+PdfRomeo stops being a rack of 43 separate tools and becomes a document
+workspace. Opening a PDF no longer just remembers a file path for the next
+tool to read — it opens a live session you can read, search, annotate,
+redact and reorganize, with the file itself on screen the whole time.
+
+### The document is the app now
+
+- **Document tabs.** Several PDFs stay open at once; Home is a permanent
+  first tab holding the tool grid. Each tab shows a dot when it has
+  unsaved changes, and closing one asks before discarding them — as does
+  quitting, which previously killed running jobs and unsaved edits without
+  a word.
+- **A real viewer.** All pages scroll continuously on a dark canvas
+  instead of one page at a time. Rendering happens on a worker thread with
+  a memory-budgeted cache, so scrolling a 400-page scan no longer freezes
+  the window, and pages are rendered at the display's pixel ratio — they
+  are sharp on Retina for the first time.
+- **Text selection.** Drag to select across pages, double-click for a
+  word, triple-click for a line, ⌘C to copy. Nothing in the app could
+  select text before.
+- **Side panels** on an Acrobat-style icon rail: page thumbnails
+  (drag to reorder, rotate, delete, extract, insert), bookmarks (browse,
+  add, rename, delete), search, and comments.
+- **A tools pane** on the right reaches every batch tool without leaving
+  the document, and the 43 tool pages themselves are unchanged.
+
+### Commenting
+
+Eleven annotation types — highlight, underline, strikethrough, squiggly,
+sticky note, text box, freehand ink, rectangle, ellipse, line and arrow —
+with a colour picker and line-width control. The comments panel lists
+every annotation with its author, page and text; clicking one jumps to it,
+double-clicking an annotation on the page edits it. Author defaults to
+your account name and is editable per comment.
+
+### Redaction
+
+Mark regions or drag across text, then apply: the content is genuinely
+removed from the file rather than covered with a black box. Applying
+redactions clears the undo history, because content you deliberately
+destroyed must not be recoverable with ⌘Z.
+
+### Search
+
+Find-as-you-type across the whole document, with every match highlighted
+in the page, the current one emphasized, and a result list showing page
+numbers and surrounding text. ⌘F focuses it; clicking a result or pressing
+Enter walks the matches.
+
+### Editing safely
+
+- **Undo and redo** (⌘Z / ⇧⌘Z) across annotations, page operations and
+  bookmarks, capped by both step count and total memory so a 200 MB scan
+  cannot exhaust RAM. One gesture is one undo step, even when a highlight
+  spans a page break.
+- **Save (⌘S) writes in place atomically**, and a document opened with a
+  password is re-encrypted on save. A plain save would have silently
+  stripped the protection — PyMuPDF drops encryption on write unless asked
+  otherwise.
+- **Password-protected files open.** Previously they were rejected at the
+  door, which also made the Unlock tool unreachable: it required an open
+  document, and the document could not be opened.
+- Saving, redacting and inserting run on a worker thread behind a progress
+  dialog instead of blocking the window, and a save that fails (moved
+  folder, ejected volume) offers Save As rather than raising.
+- If a batch tool rewrites the open file, returning to its tab offers to
+  reload it.
+
+### Also
+
+- **Print** (⌘P) with a page range, capped at 300 dpi so a print job
+  cannot allocate hundreds of megabytes per page.
+- **Document properties** (⌘D): editable metadata, page geometry, file
+  size, encryption state, and the font list.
+- **Recent files** on Home now show first-page thumbnails, keep 20 entries
+  instead of 5, and prune themselves when a file has moved.
+- **Full menus** — File, Edit, View, Tools, Help — with the shortcuts a
+  PDF app is expected to have (⌘O ⌘S ⇧⌘S ⌘W ⌘P ⌘D ⌘Z ⇧⌘Z ⌘C ⌘F ⌘+ ⌘− ⌘0
+  ⌘1 ⌘2 ⌘G), and "Open With PdfRomeo" now works while the app is running.
+- **A genuinely dark theme.** `apply_dark_theme` has applied a light theme
+  since 1.1.3; it is now the dark, flat, quiet chrome the name promised.
+
+New modules: `app/engine/session.py` (the stateful document session; the
+engine layer stays Qt-free), `app/ui/docview.py`, `app/ui/panels.py`,
+`app/ui/commenting.py`, `app/ui/docprops.py`, `app/ui/printing.py`,
+`app/ui/workspace.py`. New tests: `tests/test_session.py` (139 checks) and
+`tests/smoke_workspace.py` (30 checks). The dead `app/ui/viewer.py`, which
+nothing had imported since 1.0, is gone.
+
 ## 1.2.0
 
 The app now shows the document it is working on, and the editor is driven

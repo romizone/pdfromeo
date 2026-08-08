@@ -55,19 +55,50 @@ def main() -> int:
     deps.configure_native_libs()
     _configure_qt_plugins()
 
-    from PySide6.QtCore import Qt
-    from PySide6.QtGui import QIcon, QPalette, QColor
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
     from app.ui.main_window import MainWindow
     from app.ui.styles import apply_dark_theme
+
+    class PdfRomeoApplication(QApplication):
+        """QApplication that honours macOS 'Open With' while running.
+
+        Finder does not pass a path on argv for an already-running bundle;
+        it posts a ``QEvent.FileOpen`` instead. Events can also arrive
+        before the window exists (double-clicking a PDF *launches* the
+        app), so anything that turns up early is buffered and replayed.
+        """
+
+        def __init__(self, argv: list[str]) -> None:
+            super().__init__(argv)
+            self._window: MainWindow | None = None
+            self._pending: list[str] = []
+
+        def attach_window(self, window: MainWindow) -> None:
+            self._window = window
+            pending, self._pending = self._pending, []
+            for path in pending:
+                window.open_document(path)
+
+        def event(self, event) -> bool:
+            if event.type() == QEvent.Type.FileOpen:
+                path = event.file() or event.url().toLocalFile()
+                if path:
+                    if self._window is not None:
+                        self._window.open_document(path)
+                    else:
+                        self._pending.append(path)
+                    return True
+            return super().event(event)
 
     # High-DPI is on by default in Qt6, but make sure rounding policy is sane
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
 
-    app = QApplication(sys.argv)
+    app = PdfRomeoApplication(sys.argv)
     app.setApplicationName("PdfRomeo")
     app.setApplicationDisplayName("PdfRomeo")
     app.setOrganizationName("PdfRomeo")
@@ -82,6 +113,9 @@ def main() -> int:
 
     window = MainWindow()
     window.show()
+    # After show(): open_document only switches tabs on a visible window,
+    # and this also replays any FileOpen that arrived during startup.
+    app.attach_window(window)
 
     # Open files passed via Finder / CLI
     args = [a for a in sys.argv[1:] if not a.startswith("-")]

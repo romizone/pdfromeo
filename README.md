@@ -4,11 +4,13 @@
 
 # PdfRomeo
 
-**A professional, user-friendly PDF toolkit for macOS (Apple Silicon).**
+**A professional PDF workspace for macOS (Apple Silicon).**
 
-43 tools — organize, edit, sign, convert, protect, OCR — all in one clean,
-native-feeling desktop app. Built with PySide6, [pikepdf](https://github.com/pikepdf/pikepdf),
-and [PyMuPDF](https://pymupdf.readthedocs.io/).
+Read, annotate, redact, search and reorganize your PDFs — plus 43 batch
+tools for organizing, converting, protecting and OCR. All in one clean,
+native-feeling desktop app. Built with PySide6,
+[pikepdf](https://github.com/pikepdf/pikepdf), and
+[PyMuPDF](https://pymupdf.readthedocs.io/).
 
 [**Download**](https://github.com/romizone/pdfromeo/releases/latest) · [Report Bug](https://github.com/romizone/pdfromeo/issues) · [Request Feature](https://github.com/romizone/pdfromeo/issues)
 
@@ -17,6 +19,34 @@ and [PyMuPDF](https://pymupdf.readthedocs.io/).
 ---
 
 ## ✨ Features
+
+### 🖥 The workspace
+- **Document tabs** — several PDFs open at once, with unsaved-change dots
+  and a save prompt before closing or quitting
+- **Continuous viewer** — every page on one dark canvas, threaded
+  rendering, Retina-sharp, zoom 10–640%, fit width/page
+- **Text selection** across pages (double-click a word, triple-click a
+  line, ⌘C to copy)
+- **Side panels** — page thumbnails, bookmarks, search, comments
+- **Tools pane** — reach all 43 batch tools without leaving the document
+
+### 💬 Comment & review
+- **Highlight, Underline, Strikethrough, Squiggly** on selected text
+- **Sticky notes**, **text boxes**, **freehand ink**
+- **Rectangle, Ellipse, Line, Arrow** with colour and line width
+- **Comments panel** listing every annotation by author, page and date
+
+### 🔍 Search, redact, protect
+- **Find** across the document (⌘F) with every match highlighted
+- **Redact** — mark regions or text, then apply; content is removed from
+  the file, not painted over
+- **Password-protected PDFs open** (and stay encrypted when you save)
+
+### 📄 Document handling
+- **Undo / redo** (⌘Z / ⇧⌘Z) across annotations, pages and bookmarks
+- **Save in place** (⌘S) atomically, **Save As** (⇧⌘S)
+- **Print** (⌘P) and **Document properties** (⌘D)
+- **Page thumbnails** — drag to reorder, rotate, delete, extract, insert
 
 ### 📂 Organize
 - **Merge** PDFs & images
@@ -61,11 +91,14 @@ and [PyMuPDF](https://pymupdf.readthedocs.io/).
 
 <div align="center">
 
-### Home — Tool Grid
-*The Sejda-inspired landing page: search, browse, and pick a tool.*
+### Workspace
+*The document on a dark canvas, panels on the left rail, tools on the right.*
 
-### Tool Page
-*Every tool is a focused single-task page with drag-and-drop file input.*
+### Comment & Review
+*Highlights, notes and shapes, with every annotation listed in the panel.*
+
+### Home
+*Recent files with thumbnails, and the full grid of 43 tools.*
 
 </div>
 
@@ -84,9 +117,11 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The app opens on a clean home page listing all 43 tools. Click a card (or
-use the search box) to enter a focused single-task page. Drag a PDF onto
-the drop zone, or use **Browse files** to start.
+The app opens on Home: recent files at the top, all 43 tools below. Open a
+PDF (⌘O, drag it onto the window, or click a recent file) and it opens in
+its own tab — the document on screen, panels on the left rail, tools on
+the right. Home stays put as the first tab, so batch tools are always one
+click away.
 
 ### Build a `.app` and `.dmg`
 
@@ -175,42 +210,74 @@ PdfRomeo/
 │   └── build_macos.sh       # one-shot build → .app + .dmg
 ├── app/
 │   ├── engine/              # all PDF operations (no Qt imports)
-│   │   ├── pdf_engine.py    # pikepdf + PyMuPDF façade
+│   │   ├── pdf_engine.py    # pikepdf + PyMuPDF façade (stateless)
+│   │   ├── session.py       # DocumentSession — live doc, undo, annots
 │   │   └── convert.py       # PDF ↔ Word/Excel/PPT/JPG/HTML
 │   ├── workers/             # background QThread workers
 │   └── ui/
-│       ├── main_window.py   # top nav + stack(home, tool)
-│       ├── home.py          # homepage tool grid
+│       ├── main_window.py   # document tabs + menus
+│       ├── workspace.py     # one open document: viewer + panels + tools
+│       ├── docview.py       # continuous viewer, threaded rendering
+│       ├── panels.py        # thumbnails / bookmarks / search / comments
+│       ├── commenting.py    # annotation toolbar + note dialog
+│       ├── docprops.py      # document properties
+│       ├── printing.py      # print pipeline
+│       ├── home.py          # recent files + tool grid
 │       ├── widgets.py       # DropZone, OutputPicker
-│       ├── viewer.py        # PDF preview
-│       ├── styles.py        # light theme (Sejda-inspired)
+│       ├── preview.py       # single-page preview used by tool pages
+│       ├── styles.py        # dark theme
 │       └── tools/           # one focused page per tool
 ├── resources/
 │   └── icons/               # app icon set (.png + .icns)
 └── tests/
     ├── smoke_engine.py      # offline engine test (40+ ops)
-    └── smoke_ui.py          # UI / tool / home test
+    ├── regression.py        # one check per historical bug
+    ├── test_session.py      # DocumentSession (annots, undo, search…)
+    ├── smoke_workspace.py   # the v2 workspace end to end
+    └── smoke_ui.py          # UI / 43 tool panels / home
 ```
 
 The engine layer (`app/engine/`) has **no Qt imports** so you can drive it
-from a CLI, a server, or a test harness without spinning up a window.
+from a CLI, a server, or a test harness without spinning up a window —
+that includes `DocumentSession`, the stateful document model behind the
+workspace.
 
 ---
 
 ## 🧪 Running the smoke tests
 
 ```bash
-# Engine test — runs every PDF operation end-to-end
+# Engine — every PDF operation end to end
 PYTHONPATH=. python tests/smoke_engine.py
 
-# UI test — instantiates the home + all 43 tool panels
-QT_QPA_PLATFORM=offscreen python tests/smoke_ui.py
+# Regression — one check per bug that shipped in an earlier release
+PYTHONPATH=. python tests/regression.py
+
+# DocumentSession — annotations, undo, search, redaction, saving
+PYTHONPATH=. python tests/test_session.py
+
+# Workspace — viewer, panels, commenting, page ops (headless)
+QT_QPA_PLATFORM=offscreen PYTHONPATH=. python tests/smoke_workspace.py
+
+# UI — home, search and all 43 tool panels (headless)
+QT_QPA_PLATFORM=offscreen PYTHONPATH=. python tests/smoke_ui.py
 ```
 
 The engine test creates a 3-page sample PDF in a temp dir, runs every
 method, asserts a non-zero file is produced, and prints
 `✅ All engine smoke tests passed.` It catches the boring import /
 dependency problems before you even launch the GUI.
+
+> **If Qt cannot find its platform plugin** (`Could not find the Qt
+> platform plugin "offscreen"`), the checkout is probably in an
+> iCloud-synced folder: Qt's directory enumeration goes blind there while
+> plain `os.listdir` still works. Copy the plugins somewhere local and
+> point Qt at the copy:
+>
+> ```bash
+> cp -R .venv/lib/python3.*/site-packages/PySide6/Qt/plugins/platforms /tmp/qtplugins/
+> export QT_QPA_PLATFORM_PLUGIN_PATH=/tmp/qtplugins/platforms
+> ```
 
 ---
 
@@ -241,6 +308,10 @@ cryptographic code.
 
 ## 🗺 Roadmap
 
+- [ ] Tile-based rendering, for zoom beyond 640%
+- [ ] Drag-to-re-nest bookmarks in the outline panel
+- [ ] Document compare (side-by-side diff)
+- [ ] Digital certificate (PKI) signatures
 - [ ] Real form-field auto-detection via ML (currently a deterministic baseline)
 - [ ] Apple Silicon–native PDF rendering (Metal-backed instead of Qt's image path)
 - [ ] Plug-in system for community-contributed tools

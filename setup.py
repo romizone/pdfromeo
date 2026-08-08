@@ -16,7 +16,10 @@ PY_TAG = f"{sys.version_info.major}.{sys.version_info.minor}"
 #: Qt bindings the app imports. Everything else in the wheel is pruned from
 #: the bundle, along with any framework outside these modules' dependency
 #: closure.
-_QT_MODULES = ("QtCore", "QtGui", "QtWidgets")
+# QtPrintSupport joined the list in 2.0: app/ui/printing.py imports it at
+# module scope, so pruning it would break the bundle at launch, not just
+# when the user prints.
+_QT_MODULES = ("QtCore", "QtGui", "QtWidgets", "QtPrintSupport")
 
 #: Plugin directories Qt loads at runtime rather than by linkage, so they
 #: never show up in the dependency closure.
@@ -132,9 +135,13 @@ OPTIONS = {
     # leaves out Qt WebEngine and the rest of the Addons.
     "includes": [
         "app.engine", "app.engine.pdf_engine", "app.engine.convert",
+        "app.engine.session",
         "app.workers", "app.workers.background",
         "app", "app.deps",
-        "app.ui", "app.ui.main_window", "app.ui.viewer",
+        "app.ui", "app.ui.main_window",
+        "app.ui.workspace", "app.ui.docview", "app.ui.panels",
+        "app.ui.commenting", "app.ui.docprops", "app.ui.printing",
+        "app.ui.preview",
         "app.ui.home", "app.ui.tool_registry", "app.ui.widgets",
         "app.ui.styles",
         "app.ui.tools", "app.ui.tools.base", "app.ui.tools.organize",

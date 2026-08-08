@@ -7,8 +7,8 @@
 # Requirements (run once):
 #     xcode-select --install
 #     brew install create-dmg
-#     brew install python@3.11
-#     python3.11 -m venv .venv && source .venv/bin/activate
+#     brew install python@3.13
+#     python3.13 -m venv .venv && source .venv/bin/activate
 #     pip install -r requirements.txt
 #
 # Output:
@@ -33,12 +33,22 @@ if [[ "$(uname -m)" != "arm64" ]]; then
   echo "WARNING: Not running on Apple Silicon. Forcing arm64 build."
 fi
 
-# Python 3.11 specifically: the Qt platform plugins shipped with PySide6
-# do not load under the Python 3.9 that comes with Xcode on Apple Silicon,
-# which leaves the built app unable to start.
-PY="${PYTHON:-python3.11}"
-if ! command -v "$PY" >/dev/null 2>&1; then
-  echo "ERROR: $PY not found. Install it with: brew install python@3.11" >&2
+# Any modern Homebrew Python works; what does NOT is the Python 3.9 that
+# comes with Xcode on Apple Silicon, whose Qt platform plugins fail to load
+# and leave the built app unable to start. Prefer whatever the existing
+# .venv already uses, so the bundle matches the interpreter the tests ran on.
+if [[ -z "${PYTHON:-}" && -x .venv/bin/python ]]; then
+  PYTHON="$(.venv/bin/python -c 'import sys; print(sys.executable)')"
+fi
+PY="${PYTHON:-}"
+if [[ -z "$PY" ]]; then
+  for candidate in python3.13 python3.12 python3.11; do
+    if command -v "$candidate" >/dev/null 2>&1; then PY="$candidate"; break; fi
+  done
+fi
+if [[ -z "$PY" ]] || ! command -v "$PY" >/dev/null 2>&1; then
+  echo "ERROR: no suitable Python found. Install one with: brew install python@3.13" >&2
+  echo "       (or set PYTHON=/path/to/python before running this script)" >&2
   exit 1
 fi
 echo "Using Python: $($PY --version)"
