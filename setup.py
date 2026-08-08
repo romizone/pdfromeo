@@ -135,7 +135,8 @@ OPTIONS = {
     # leaves out Qt WebEngine and the rest of the Addons.
     "includes": [
         "app.engine", "app.engine.pdf_engine", "app.engine.convert",
-        "app.engine.session",
+        "app.engine.session", "app.engine.fontmetrics",
+        "app.engine.textblocks", "app.engine.reflow",
         "app.workers", "app.workers.background",
         "app", "app.deps",
         "app.ui", "app.ui.main_window",
