@@ -14,6 +14,15 @@ public API speaks ROTATED (displayed) space exclusively and converts at its
 own edge with ``page.rotation_matrix`` (outbound) / ``page.derotation_matrix``
 (inbound), so the viewer and panels never think about page rotation.
 
+Paragraph reflow (spec §9, Phase A) is bolted on at the end of this file. It
+lives here rather than in :mod:`app.engine.reflow` because only the session
+owns the two things a safe edit needs: the undo snapshot that makes a
+half-written page recoverable, and the lock that keeps the render thread out
+while the page's content stream is being rewritten. Phase A never moves
+anything on the page — a paragraph that no longer fits its own vertical space
+is DECLINED — so one reflow is exactly one snapshot, and there is no
+pristine-page replay log to keep in step with undo.
+
 Like the rest of ``app.engine``, this module never imports Qt and raises
 :class:`EngineError` with complete user-facing sentences for every failure.
 """
@@ -29,6 +38,11 @@ from typing import Iterator, Sequence
 import fitz  # PyMuPDF
 
 from .pdf_engine import EngineError
+from .reflow import REDACT_PAD, ReflowResult, reflow_in_place
+from .textblocks import (
+    Paragraph, Run, paragraph_at as _detect_paragraph_at,
+    paragraphs as _detect_paragraphs,
+)
 
 # One lock for ALL sessions: PyMuPDF promises no cross-document thread-safety
 # either, and only one tab is visible at a time, so throughput is unaffected.
@@ -974,3 +988,247 @@ class DocumentSession:
             self._undo.clear()
             self._redo.clear()
             self._words_cache.clear()
+
+    # ------------------------------------------------------------------
+    # Paragraph reflow — spec §9, Phase A
+    # ------------------------------------------------------------------
+
+    def paragraphs(self, page: int) -> list[Paragraph]:
+        """Every paragraph on *page*, each carrying its §8 reflow verdict.
+
+        Deliberately NOT cached. A cache would have to be invalidated from
+        ``_after_mutation``/``_reopen``, and a paragraph list that survives an
+        edit by one call too many is exactly how the wrong paragraph gets
+        rewritten: ``Paragraph.index`` is an ordinal on the page, so a stale
+        list silently renames every paragraph after the one that changed.
+        Detection is a few tens of milliseconds on a dense page; correctness
+        is worth more than that here.
+
+        Each :class:`~app.engine.textblocks.Paragraph` carries BOTH spaces:
+        ``bbox`` is unrotated PDF space (what the engine works in) and
+        ``bbox_display`` is the displayed space every other session API
+        speaks, so the viewer never has to think about page rotation.
+        """
+        with _FITZ_LOCK:
+            self._ensure_open()
+            self._page(page)              # range check, session wording
+            try:
+                return _detect_paragraphs(self._doc, int(page))
+            except EngineError:
+                raise
+            except Exception as exc:      # pragma: no cover - defensive
+                raise EngineError(
+                    f"Could not read the paragraphs on page {int(page) + 1}: "
+                    f"{exc}") from exc
+
+    def paragraph_at(self, page: int, x: float,
+                     y: float) -> Paragraph | None:
+        """The paragraph under a DISPLAYED-space point, or ``None``.
+
+        Same coordinate contract as :meth:`annotation_at` and
+        :meth:`add_note`: the caller hands over the point it drew on screen
+        and the conversion to unrotated page space happens here (in
+        ``textblocks.paragraph_at``, via ``page.derotation_matrix``).
+
+        A paragraph that fails the §8 gate is still returned, with
+        ``reflowable=False`` and a ``reason``, so the UI can explain itself
+        and fall back to the old single-span replace path.
+        """
+        with _FITZ_LOCK:
+            self._ensure_open()
+            self._page(page)              # range check, session wording
+            try:
+                return _detect_paragraph_at(self._doc, int(page),
+                                            float(x), float(y))
+            except EngineError:
+                raise
+            except Exception as exc:      # pragma: no cover - defensive
+                raise EngineError(
+                    f"Could not read the paragraphs on page {int(page) + 1}: "
+                    f"{exc}") from exc
+
+    def _resolve_paragraph(self, page: int, para_key) -> Paragraph:
+        """``para_key`` -> the paragraph as it exists on the page RIGHT NOW.
+
+        Accepts the ordinal, the ``(page, ordinal)`` tuple that
+        ``Paragraph.key`` returns, or a whole :class:`Paragraph`. The list is
+        always re-derived, because the key is an ordinal and the caller's copy
+        may predate an edit; when a whole Paragraph is handed in, its text and
+        geometry are checked against the freshly detected one and a mismatch
+        is refused rather than rewritten. Editing "paragraph 7" of a page that
+        has since been re-numbered is the corruption this catches.
+        """
+        found = self.paragraphs(page)
+        wanted = para_key
+        if isinstance(wanted, Paragraph):
+            index = wanted.index
+        elif isinstance(wanted, (tuple, list)):
+            if len(wanted) != 2:
+                raise EngineError(
+                    "A paragraph key must be (page number, paragraph number).")
+            key_page, index = int(wanted[0]), int(wanted[1])
+            if key_page != int(page):
+                raise EngineError(
+                    f"That paragraph belongs to page {key_page + 1}, not page "
+                    f"{int(page) + 1}, so nothing was changed.")
+        elif isinstance(wanted, int) and not isinstance(wanted, bool):
+            index = int(wanted)
+        else:
+            raise EngineError(
+                "A paragraph key must be a paragraph, its number, or "
+                "(page number, paragraph number).")
+        if index < 0 or index >= len(found):
+            raise EngineError(
+                f"That paragraph is no longer on page {int(page) + 1}, so "
+                "nothing was changed. Click the paragraph again.")
+        fresh = found[index]
+        if isinstance(wanted, Paragraph):
+            moved = max(abs(a - b) for a, b in zip(fresh.bbox, wanted.bbox))
+            if fresh.text != wanted.text or moved > 0.5:
+                raise EngineError(
+                    f"Page {int(page) + 1} has changed since this paragraph "
+                    "was selected, so nothing was changed. Click the "
+                    "paragraph again.")
+        return fresh
+
+    def reflow_paragraph(self, page: int, para_key, new_runs: list[Run], *,
+                         allow_push: bool = False,
+                         allow_shrink: bool = False) -> ReflowResult:
+        """Re-wrap one paragraph in its own fonts, inside its own space.
+
+        Phase A is a safety boundary, not a milestone: every successful call is
+        same-page and same-geometry — the first baseline does not move, the
+        last lands no lower than the original's, and nothing else on the page
+        is touched. Text that needs more room comes back as ``ok=False`` with
+        an explanation and NOTHING is written, which is why the whole
+        operation fits under one ordinary undo snapshot with no pristine-page
+        replay log (§6.4). ``allow_push`` and ``allow_shrink`` are Phase B and
+        are refused here rather than silently ignored.
+
+        Two independent guards stand between an edit and a corrupt page:
+
+        * ``reflow.reflow_in_place`` re-reads the drawn origin and rolls the
+          PAGE back on a mismatch;
+        * this method diffs the page's word multiset OUTSIDE the paragraph's
+          own rect across the whole operation (§9's runtime invariant) and
+          rolls the DOCUMENT back to its pre-edit bytes if a single word
+          elsewhere moved, changed or vanished.
+
+        They are kept separate on purpose. The inner one cannot recover from a
+        failure of its own rollback, and the outer one is the only thing that
+        would catch a future bug *between* the two — which is precisely the
+        class of bug the critique found three times.
+
+        Returns a :class:`~app.engine.reflow.ReflowResult`; raises
+        :class:`EngineError` only for conditions the user cannot fix by
+        editing the text.
+        """
+        with _FITZ_LOCK:
+            # _ensure_open comes first, like every other mutator: a caller that
+            # kept a session past close() must hear "Document is closed."
+            # rather than a complaint about its arguments.
+            self._ensure_open()
+            runs = list(new_runs or [])
+            if not runs:
+                # §7.3: an emptied paragraph disappears from paragraphs() and
+                # can never be clicked again, while its vertical space stays
+                # open forever.
+                raise EngineError(
+                    "A paragraph cannot be emptied — leave at least one space, "
+                    "or delete it with the eraser.")
+            if allow_push:
+                raise EngineError(
+                    "Moving the text below a paragraph down to make room is "
+                    "not available in this version, so this paragraph was left "
+                    "unchanged.")
+            if allow_shrink:
+                raise EngineError(
+                    "Shrinking a paragraph's type to make it fit is not "
+                    "available in this version, so this paragraph was left "
+                    "unchanged.")
+            self._page(page)              # range check, session wording
+            index = int(page)
+            para = self._resolve_paragraph(index, para_key)
+
+            # The only region this edit is allowed to change: the paragraph's
+            # own rect, widened by the redaction pad so a glyph the redaction
+            # legitimately clips does not read as damage. Everything else on
+            # the page is compared word for word, position included, because a
+            # word that MOVED is as corrupt as one that vanished.
+            zone = fitz.Rect(para.bbox) + (-REDACT_PAD, -REDACT_PAD,
+                                           REDACT_PAD, REDACT_PAD)
+            untouchable = _words_outside_rect(self._doc[index], zone)
+
+            with self.compound():
+                pushed = not self._compound_snapshotted
+                redo_before = list(self._redo) if pushed else []
+                self._begin_mutation()
+                rollback = (self._undo[-1] if pushed
+                            else self._doc.tobytes())
+
+                def undo_the_snapshot() -> None:
+                    if not pushed:
+                        return
+                    self._undo.pop()
+                    self._redo[:] = redo_before
+                    self._compound_snapshotted = False
+
+                try:
+                    result = reflow_in_place(self._doc, self._doc[index],
+                                             para, runs)
+                    # Checked on BOTH paths, not just the successful one: a
+                    # refusal is supposed to write nothing at all, and this is
+                    # the only thing that would notice if some future refusal
+                    # path stopped honouring that.
+                    if _words_outside_rect(self._doc[index],
+                                           zone) != untouchable:
+                        raise EngineError(
+                            "Re-wrapping this paragraph would have changed "
+                            "text elsewhere on page "
+                            f"{index + 1}, so nothing was changed.")
+                except Exception:
+                    # reflow_in_place restores the PAGE, but a bug between its
+                    # rollback and this line would leave a mangled document
+                    # behind. Restoring the pre-edit bytes costs one reopen on
+                    # a path that already failed, and it is unconditional. If
+                    # even that fails the user must hear about it, so its own
+                    # error is allowed to replace this one — but the phantom
+                    # undo step is dropped either way.
+                    try:
+                        self._reopen(rollback)
+                    finally:
+                        undo_the_snapshot()
+                    raise
+                if not result.ok:
+                    # Refusals write nothing, so the snapshot must go too:
+                    # leaving it would light up Undo for an unchanged document
+                    # and mark a pristine file as modified.
+                    undo_the_snapshot()
+                    return result
+                self._after_mutation()
+                return result
+
+
+def _words_outside_rect(page: "fitz.Page", zone: "fitz.Rect") -> list[tuple]:
+    """Every word on *page* that an edit confined to *zone* must not touch.
+
+    Spec §9's runtime invariant, and the critique's judgement that it is worth
+    more than any offline test: a mis-mapped rotated page, an over-wide
+    redaction and a lost earlier edit all show up here as a changed multiset,
+    which turns three silent corruption modes into one refusal.
+
+    Positions are part of the key, rounded to 0.1 pt — a word that MOVED is as
+    much a corruption as one that vanished, and MuPDF re-reports untouched
+    glyphs at bit-identical coordinates, so the rounding is slack, not
+    tolerance. A word merely INTERSECTING the zone is dropped rather than
+    compared, because the redaction pad legitimately clips glyphs at the
+    paragraph's edge.
+    """
+    out: list[tuple] = []
+    for x0, y0, x1, y1, word, *_rest in page.get_text("words"):
+        if fitz.Rect(x0, y0, x1, y1).intersects(zone):
+            continue
+        out.append((round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1),
+                    word))
+    out.sort()
+    return out

@@ -30,6 +30,14 @@ native-feeling desktop app. Built with PySide6,
 - **Side panels** — page thumbnails, bookmarks, search, comments
 - **Tools pane** — reach all 43 batch tools without leaving the document
 
+### ✍️ Edit text with reflow
+- **Double-click a paragraph and retype it** — the whole paragraph re-wraps
+- Keeps the document's **own font**, its justification, and inline bold/italic
+- Declines with a plain reason where re-wrapping would do damage (tables,
+  contents pages, rotated or multi-column pages, OCR layers)
+- Never moves the rest of the page: an edit that needs more room is refused
+  rather than written
+
 ### 💬 Comment & review
 - **Highlight, Underline, Strikethrough, Squiggly** on selected text
 - **Sticky notes**, **text boxes**, **freehand ink**
@@ -212,6 +220,9 @@ PdfRomeo/
 │   ├── engine/              # all PDF operations (no Qt imports)
 │   │   ├── pdf_engine.py    # pikepdf + PyMuPDF façade (stateless)
 │   │   ├── session.py       # DocumentSession — live doc, undo, annots
+│   │   ├── fontmetrics.py   # exact text measurement from the PDF itself
+│   │   ├── textblocks.py    # paragraph reconstruction + safety gate
+│   │   ├── reflow.py        # line breaking + content-stream emission
 │   │   └── convert.py       # PDF ↔ Word/Excel/PPT/JPG/HTML
 │   ├── workers/             # background QThread workers
 │   └── ui/
@@ -233,6 +244,7 @@ PdfRomeo/
     ├── smoke_engine.py      # offline engine test (40+ ops)
     ├── regression.py        # one check per historical bug
     ├── test_session.py      # DocumentSession (annots, undo, search…)
+    ├── test_reflow.py       # paragraph reflow (metrics, wrap, emit)
     ├── smoke_workspace.py   # the v2 workspace end to end
     └── smoke_ui.py          # UI / 43 tool panels / home
 ```
@@ -255,6 +267,9 @@ PYTHONPATH=. python tests/regression.py
 
 # DocumentSession — annotations, undo, search, redaction, saving
 PYTHONPATH=. python tests/test_session.py
+
+# Paragraph reflow — measurement, detection, re-wrapping, safety gate
+PYTHONPATH=. python tests/test_reflow.py
 
 # Workspace — viewer, panels, commenting, page ops (headless)
 QT_QPA_PLATFORM=offscreen PYTHONPATH=. python tests/smoke_workspace.py

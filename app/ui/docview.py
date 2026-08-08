@@ -16,10 +16,21 @@ Teardown contract: ``set_session(None)`` (and closeEvent) bumps the render
 generation, drains the request queue and quit()+wait()s the thread BEFORE
 the caller closes the session — the worker is quiescent whenever its queue
 is empty, so an un-quit thread at interpreter exit can never be mid-fitz.
+
+Paragraph reflow (spec §10) adds a ``text`` mode and an on-page editor. The
+overlay is a child of the CONTENT widget rather than of the viewport, so it
+scrolls with its page for free and never has to be told about scrolling; it
+is placed by measuring the chrome the global stylesheet puts between the
+widget edge and its viewport, so the editable text area lands exactly on the
+paragraph's own measure whatever padding the theme uses. Everything about
+the edit is deliberately synchronous up to the commit and deferred after it:
+committing runs a session mutation, and a mutation inside a mouse handler
+would re-enter the canvas it was dispatched from.
 """
 from __future__ import annotations
 
 import math
+import re
 import threading
 import time
 from collections import OrderedDict, deque
@@ -27,12 +38,16 @@ from typing import TYPE_CHECKING
 
 import fitz  # PyMuPDF
 from PySide6.QtCore import (
-    QEvent, QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot,
+    QEvent, QObject, QPoint, QPointF, QRectF, Qt, QThread, QTimer, Signal,
+    Slot,
 )
 from PySide6.QtGui import (
-    QColor, QGuiApplication, QImage, QPainter, QPen,
+    QColor, QFont, QGuiApplication, QImage, QPainter, QPen, QTextCursor,
+    QTextOption,
 )
-from PySide6.QtWidgets import QFrame, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QFrame, QScrollArea, QTextEdit, QVBoxLayout, QWidget,
+)
 
 from ..engine.pdf_engine import EngineError
 from .styles import ACCENT, CANVAS
@@ -60,9 +75,27 @@ _TEXT_MARKUP_MODES = frozenset(
     {"highlight", "underline", "strikeout", "squiggly"})
 _SHAPE_MODES = frozenset({"textbox", "rect", "ellipse", "line", "arrow"})
 _MODES = frozenset(
-    {"select", "hand", "note", "ink", "redact"}
+    {"select", "hand", "note", "ink", "redact", "text"}
     | _TEXT_MARKUP_MODES | _SHAPE_MODES
 )
+
+# --- paragraph editing (spec §10) -----------------------------------------
+_ALIGN_FLAGS = {
+    "left": Qt.AlignmentFlag.AlignLeft,
+    "center": Qt.AlignmentFlag.AlignHCenter,
+    "right": Qt.AlignmentFlag.AlignRight,
+    "justify": Qt.AlignmentFlag.AlignJustify,
+}
+# A subset prefix ('ABCDEF+') and a trailing style word are naming conventions
+# inside the PDF, not part of the family Qt knows: 'Georgia Regular' has to
+# become 'Georgia' or Qt substitutes its default sans for the whole overlay.
+_SUBSET_PREFIX = re.compile(r"^[A-Z]{6}\+")
+_STYLE_SUFFIX = re.compile(
+    r"[ ,_-]*(regular|book|roman|bold|italic|oblique|light|medium|semibold|"
+    r"demibold|black|heavy|thin|bolditalic|boldoblique)$", re.IGNORECASE)
+_NOT_EDITABLE = ("This part of the page cannot be re-wrapped, so it was left "
+                 "unchanged.")
+_MIN_EDITOR_PX = 8      # a degenerate bbox must still give a clickable box
 
 # Painting colours (painting is not stylesheet territory).
 _PAGE_FILL = QColor("#ffffff")
@@ -180,6 +213,81 @@ class _PagesWidget(QWidget):
         self._owner._canvas_double_click(event)
 
 
+class _ParagraphEditor(QTextEdit):
+    """The on-page overlay a paragraph is retyped in (spec §10).
+
+    Deliberately dumb: it owns the three gestures that end an edit and knows
+    nothing about paragraphs, sessions or reflow. ``_finished`` is not
+    defensive tidiness — committing tears this widget down, tearing it down
+    moves the focus, and moving the focus is itself one of the three ending
+    gestures, so without the latch a commit re-enters itself.
+
+    Styling is the global QSS's business (objectName only); the FONT is not,
+    because it has to match the paragraph on the page rather than the theme.
+    It is set on the document, which the stylesheet does not reach.
+    """
+
+    commit_requested = Signal()
+    cancel_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("ParagraphEditor")
+        self.setAcceptRichText(False)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.setTabChangesFocus(True)
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # The paragraph's own measure is the wrap width; QTextDocument's
+        # default 4 px margin would silently narrow it.
+        self.document().setDocumentMargin(0.0)
+        self._finished = False
+
+    def keyPressEvent(self, event) -> None:      # type: ignore[override]
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
+            event.accept()
+            self._finish(self.cancel_requested)
+            return
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            mods = event.modifiers()
+            # macOS maps ⌘ onto ControlModifier by default; Meta is accepted
+            # too so the gesture survives AA_MacDontSwapCtrlAndMeta.
+            if mods & (Qt.KeyboardModifier.ControlModifier
+                       | Qt.KeyboardModifier.MetaModifier):
+                event.accept()
+                self._finish(self.commit_requested)
+                return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event) -> None:      # type: ignore[override]
+        super().focusOutEvent(event)
+        self._finish(self.commit_requested)
+
+    def detach(self) -> None:
+        """Stop this editor ever ending itself again (owner is closing it)."""
+        self._finished = True
+
+    def _finish(self, signal) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        signal.emit()
+
+
+def _qt_family(name: str) -> str:
+    """A PDF BaseFont name -> the family Qt should look up."""
+    family = _SUBSET_PREFIX.sub("", (name or "").strip())
+    family = family.replace("-", " ").replace("_", " ")
+    previous = None
+    while previous != family:
+        previous = family
+        family = _STYLE_SUFFIX.sub("", family).strip()
+    return family
+
+
 class DocView(QWidget):
     """Continuous multi-page viewer with async rendering and edit modes."""
 
@@ -194,6 +302,10 @@ class DocView(QWidget):
     annot_double_clicked = Signal(int, int)         # page, xref
     annot_delete_requested = Signal(int, int)       # page, xref
     mode_changed = Signal(str)
+    # §10: the overlay was committed. (page, para_key, the text typed)
+    paragraph_edit_requested = Signal(int, object, str)
+    # §10: the paragraph failed the §8 gate. (page, its own `reason`)
+    paragraph_not_editable = Signal(int, str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -258,6 +370,15 @@ class DocView(QWidget):
 
         self._current_page = 0
 
+        # Paragraph editing (§10). `_edit_chrome` caches the (left, top,
+        # extra_w, extra_h) the theme puts between the widget edge and its
+        # viewport, measured once the overlay is laid out.
+        self._editor: _ParagraphEditor | None = None
+        self._edit_para = None              # engine textblocks.Paragraph
+        self._edit_chrome = (0, 0, 0, 0)
+        self._edit_settling = False
+        self._placing_editor = False
+
         # --- widgets
         self._scroll = QScrollArea()
         self._scroll.setObjectName("DocViewScroll")
@@ -307,6 +428,7 @@ class DocView(QWidget):
         self._pages.update()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._destroy_editor()
         self._stop_render_thread()
         super().closeEvent(event)
 
@@ -353,6 +475,7 @@ class DocView(QWidget):
             return False
 
     def _reset_state(self) -> None:
+        self._destroy_editor()
         self._cache.clear()
         self._cache_bytes = 0
         self._page_slot.clear()
@@ -409,6 +532,7 @@ class DocView(QWidget):
             y += h + _PAGE_GAP
         self._content_h = y - _PAGE_GAP + _MARGIN
         self._resize_content()
+        self._place_editor()
 
     def _resize_content(self) -> None:
         vw, vh = self._viewport_size()
@@ -425,6 +549,7 @@ class DocView(QWidget):
         for i, rect in enumerate(self._geo):
             x = max(float(_MARGIN), (widget_w - rect.width()) / 2.0)
             rect.moveLeft(x)
+        self._place_editor()
 
     def _viewport_size(self) -> tuple[int, int]:
         vp = self._scroll.viewport()
@@ -467,6 +592,11 @@ class DocView(QWidget):
         """Re-render after a session mutation; keeps the scroll anchor."""
         if self._session is None:
             return
+        # A mutation re-numbers paragraphs (Paragraph.index is an ordinal), so
+        # an overlay that outlived one would be pointing at whatever paragraph
+        # inherited its number. Close it without committing: the edit that
+        # caused this refresh has already landed.
+        self._destroy_editor()
         anchor = self._capture_anchor()
         self._gen.value += 1
         with self._queue_lock:
@@ -665,6 +795,8 @@ class DocView(QWidget):
             raise ValueError(f"Unknown DocView mode: {mode!r}")
         if mode == self._mode:
             return
+        # Leaving with an overlay open is "clicking outside" by another route.
+        self._finish_paragraph_edit(commit=True)
         self._cancel_drag()
         self._flush_ink()           # a mode switch commits pending strokes
         self._mode = mode
@@ -678,6 +810,7 @@ class DocView(QWidget):
     def _apply_cursor(self) -> None:
         cursors = {
             "select": Qt.CursorShape.IBeamCursor,
+            "text": Qt.CursorShape.IBeamCursor,
             "hand": Qt.CursorShape.OpenHandCursor,
             "note": Qt.CursorShape.PointingHandCursor,
         }
@@ -1093,11 +1226,25 @@ class DocView(QWidget):
         page, px, py, inside = self._page_at(pos)
         if not inside:
             return
-        if self._mode == "select":
+        if self._mode in ("select", "text"):
             info = self._annotation_at(page, px, py)
             if info is not None:
                 self.annot_double_clicked.emit(info.page, info.xref)
                 return
+            # §10: the press that opened this double click already committed
+            # any overlay it took the focus from, and that commit is a session
+            # mutation still queued behind us. Opening a second overlay now
+            # would only have it torn down by that mutation's refresh.
+            if not self._edit_settling:
+                if self._begin_paragraph_edit(page, px, py):
+                    # No triple-click state is armed: the overlay now covers
+                    # this spot, so a third click belongs to IT, and leaving
+                    # `_last_double` set would make a click somewhere else
+                    # select a line on the page behind the editor instead.
+                    return
+        if self._mode == "text":
+            return
+        if self._mode == "select":
             idx = self._word_index_at(page, px, py, tolerance=3.0)
             if idx is not None:
                 self._sel_start = (page, idx)
@@ -1208,6 +1355,11 @@ class DocView(QWidget):
         event.accept()
 
     def _escape_cascade(self) -> None:
+        # (0) abandon an open paragraph overlay — normally its own key handler
+        # gets there first, but not when the focus sits on the canvas.
+        if self._editor is not None:
+            self._finish_paragraph_edit(commit=False)
+            return
         # (1) cancel an in-progress drag / rubber band / pending ink
         if (self._drag_kind is not None or self._ink_current
                 or self._ink_strokes):
@@ -1526,11 +1678,27 @@ class DocView(QWidget):
 
         painter.save()
         painter.setClipRect(rect)
+        self._paint_edit_cover(painter, page)
         self._paint_search(painter, page)
         self._paint_selection(painter, page)
         self._paint_annot_outline(painter, page)
         self._paint_drag_overlays(painter, page)
         painter.restore()
+
+    def _paint_edit_cover(self, painter: QPainter, page: int) -> None:
+        """Blank the paragraph being edited so only the overlay's text shows.
+
+        The overlay is opaque, so this is belt to its braces — but the theme
+        gives inputs rounded corners, and without the cover the original
+        glyphs show through the four notches and read as doubled text.
+        """
+        para = self._edit_para
+        if para is None or para.page != page:
+            return
+        painter.fillRect(
+            self._pt_rect_to_widget(page, para.bbox_display).adjusted(
+                -2.0, -2.0, 2.0, 2.0),
+            _PAGE_FILL)
 
     def _paint_search(self, painter: QPainter, page: int) -> None:
         if not self._search_matches:
@@ -1609,3 +1777,283 @@ class DocView(QWidget):
     def _pt_point_to_widget(self, page: int, x: float, y: float) -> QPointF:
         geo = self._geo[page]
         return QPointF(geo.x() + x * self._zoom, geo.y() + y * self._zoom)
+
+    # ======================================================================
+    # Paragraph editing — spec §10
+    # ======================================================================
+
+    def is_editing_paragraph(self) -> bool:
+        return self._editor is not None
+
+    def editing_paragraph(self) -> tuple[int, tuple[int, int]] | None:
+        """(page, para_key) of the open overlay, or None."""
+        para = self._edit_para
+        if para is None:
+            return None
+        return int(para.page), tuple(para.key)
+
+    def paragraph_editor_text(self) -> str:
+        """What is currently typed in the overlay ('' when none is open)."""
+        editor = self._editor
+        return "" if editor is None else editor.toPlainText()
+
+    def open_paragraph_editor(self, page: int, para_key,
+                              text: str | None = None) -> bool:
+        """Open the overlay on a paragraph named by key. False if it cannot.
+
+        This is the re-entry the workspace uses for "Edit again" after a
+        refusal, so *text* may be the rejected text rather than the
+        paragraph's own — the user must get their words back, not the
+        document's.
+        """
+        para = self._paragraph_by_key(page, para_key)
+        if para is None:
+            return False
+        if not para.reflowable:
+            self.paragraph_not_editable.emit(
+                int(page), para.reason or _NOT_EDITABLE)
+            return False
+        return self._open_editor(para, text)
+
+    def commit_paragraph_edit(self) -> bool:
+        """Finish the open overlay as if ⌘↩ had been pressed."""
+        return self._finish_paragraph_edit(commit=True)
+
+    def cancel_paragraph_edit(self) -> bool:
+        """Abandon the open overlay as if Esc had been pressed."""
+        return self._finish_paragraph_edit(commit=False)
+
+    # --- hit-testing ------------------------------------------------------
+
+    def _begin_paragraph_edit(self, page: int, px: float,
+                              py: float) -> bool:
+        """Open the overlay on the paragraph under a displayed-space point."""
+        session = self._session
+        if session is None:
+            return False
+        try:
+            para = session.paragraph_at(page, px, py)
+        except EngineError:
+            return False
+        if para is None:
+            return False
+        if not para.reflowable:
+            # The reason is written to be read by the person who clicked, so
+            # it is passed through untouched rather than summarised here.
+            self.paragraph_not_editable.emit(
+                int(page), para.reason or _NOT_EDITABLE)
+            return False
+        return self._open_editor(para)
+
+    def _paragraph_by_key(self, page: int, para_key):
+        session = self._session
+        if session is None:
+            return None
+        if isinstance(para_key, (tuple, list)) and len(para_key) == 2:
+            index = int(para_key[1])
+        elif isinstance(para_key, int) and not isinstance(para_key, bool):
+            index = int(para_key)
+        else:
+            index = int(getattr(para_key, "index", -1))
+        if index < 0:
+            return None
+        try:
+            found = session.paragraphs(int(page))
+        except EngineError:
+            return None
+        if index >= len(found):
+            return None
+        return found[index]
+
+    # --- lifecycle --------------------------------------------------------
+
+    def _open_editor(self, para, text: str | None = None) -> bool:
+        if int(para.page) >= len(self._geo):
+            return False
+        self._destroy_editor()
+        editor = _ParagraphEditor(self._pages)
+        editor.commit_requested.connect(self._on_editor_commit)
+        editor.cancel_requested.connect(self._on_editor_cancel)
+        editor.textChanged.connect(self._grow_editor)
+        self._editor = editor
+        self._edit_para = para
+        self._apply_editor_style()
+        editor.setPlainText(para.text if text is None else str(text))
+        self._apply_editor_alignment()
+        editor.setGeometry(self._editor_target_rect())
+        editor.show()
+        # Only now is the viewport laid out, so only now can the theme's
+        # padding be measured and taken out of the geometry.
+        self._place_editor()
+        cursor = editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        editor.setTextCursor(cursor)
+        editor.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._pages.update()
+        return True
+
+    def _destroy_editor(self) -> None:
+        """Take the overlay down without it counting as a gesture."""
+        editor = self._editor
+        self._editor = None
+        self._edit_para = None
+        self._edit_chrome = (0, 0, 0, 0)
+        if editor is None:
+            return
+        editor.detach()
+        try:
+            editor.textChanged.disconnect(self._grow_editor)
+        except (RuntimeError, TypeError):
+            pass
+        editor.hide()
+        editor.setParent(None)
+        editor.deleteLater()
+        self._pages.update()
+
+    def _finish_paragraph_edit(self, *, commit: bool) -> bool:
+        editor = self._editor
+        para = self._edit_para
+        if editor is None or para is None:
+            return False
+        text = editor.toPlainText()
+        page, key = int(para.page), tuple(para.key)
+        editor.detach()
+        self._destroy_editor()
+        if not commit:
+            return True
+        self._edit_settling = True
+        # Cleared behind whatever the listener queues for itself, so a double
+        # click arriving in the same gesture cannot open an overlay that the
+        # pending mutation would immediately close again.
+        self.paragraph_edit_requested.emit(page, key, text)
+        QTimer.singleShot(0, self._clear_edit_settling)
+        return True
+
+    def _clear_edit_settling(self) -> None:
+        self._edit_settling = False
+
+    @Slot()
+    def _on_editor_commit(self) -> None:
+        self._finish_paragraph_edit(commit=True)
+
+    @Slot()
+    def _on_editor_cancel(self) -> None:
+        self._finish_paragraph_edit(commit=False)
+
+    # --- geometry and styling --------------------------------------------
+
+    def _editor_target_rect(self):
+        """Where the EDITABLE AREA must land: the paragraph's own box."""
+        para = self._edit_para
+        rect = self._pt_rect_to_widget(
+            int(para.page), para.bbox_display).toAlignedRect()
+        if rect.width() < _MIN_EDITOR_PX:
+            rect.setWidth(_MIN_EDITOR_PX)
+        if rect.height() < _MIN_EDITOR_PX:
+            rect.setHeight(_MIN_EDITOR_PX)
+        return rect
+
+    def _place_editor(self) -> None:
+        """Put the overlay's TEXT AREA exactly over the paragraph.
+
+        The widget is grown by whatever the global stylesheet inserts between
+        its edge and its viewport (border + padding), measured rather than
+        assumed, so a theme change cannot silently shift the text off the
+        paragraph's measure.
+        """
+        editor = self._editor
+        para = self._edit_para
+        if editor is None or para is None or self._placing_editor:
+            return
+        if int(para.page) >= len(self._geo):
+            self._destroy_editor()
+            return
+        self._placing_editor = True
+        try:
+            # The measure is in device pixels, so it moves with the zoom.
+            self._apply_editor_style()
+            target = self._editor_target_rect()
+            editor.setGeometry(target)
+            offset = editor.viewport().mapTo(editor, QPoint(0, 0))
+            left, top = max(0, offset.x()), max(0, offset.y())
+            extra_w = max(0, editor.width() - editor.viewport().width())
+            extra_h = max(0, editor.height() - editor.viewport().height())
+            self._edit_chrome = (left, top, extra_w, extra_h)
+            editor.setGeometry(target.adjusted(
+                -left, -top, extra_w - left, extra_h - top))
+        finally:
+            self._placing_editor = False
+        self._grow_editor()
+
+    def _grow_editor(self) -> None:
+        """Let the overlay get taller than the paragraph while typing.
+
+        Phase A still refuses text that does not fit the paragraph's own
+        vertical space — but refusing it is the ENGINE's job on commit, and a
+        box that clipped what the user typed would hide the very sentence the
+        refusal is about.
+        """
+        editor = self._editor
+        para = self._edit_para
+        if editor is None or para is None:
+            return
+        _left, _top, _extra_w, extra_h = self._edit_chrome
+        wanted = int(math.ceil(editor.document().size().height())) + extra_h
+        floor = self._editor_target_rect().height() + extra_h
+        height = max(floor, wanted)
+        if height != editor.height():
+            editor.resize(editor.width(), height)
+
+    def _apply_editor_style(self) -> None:
+        editor = self._editor
+        para = self._edit_para
+        if editor is None or para is None:
+            return
+        font = self._editor_font(para)
+        # The document, not the widget: the global QSS owns QTextEdit's font
+        # and would win over setFont(), but it never reaches the document.
+        editor.document().setDefaultFont(font)
+        editor.setFont(font)
+        option = QTextOption()
+        option.setAlignment(_ALIGN_FLAGS.get(para.align,
+                                             Qt.AlignmentFlag.AlignLeft))
+        option.setWrapMode(
+            QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        editor.document().setDefaultTextOption(option)
+
+    def _apply_editor_alignment(self) -> None:
+        """Re-state the alignment on the blocks themselves after setText."""
+        editor = self._editor
+        para = self._edit_para
+        if editor is None or para is None:
+            return
+        align = _ALIGN_FLAGS.get(para.align, Qt.AlignmentFlag.AlignLeft)
+        cursor = editor.textCursor()
+        cursor.select(QTextCursor.SelectionType.Document)
+        editor.setTextCursor(cursor)
+        editor.setAlignment(align)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        editor.setTextCursor(cursor)
+
+    def _editor_font(self, para) -> QFont:
+        """The paragraph's type, sized in whole DEVICE pixels at this zoom.
+
+        Rounding in device space rather than logical space is what keeps a
+        Retina overlay the same height as the glyphs underneath it; rounding
+        the logical size first is off by half a device pixel at dpr 2.
+        """
+        run = para.runs[0] if para.runs else None
+        family = _qt_family(getattr(getattr(run, "font", None), "name", ""))
+        font = QFont(family) if family else QFont()
+        dpr = float(self.devicePixelRatioF() or 1.0)
+        size_pt = float(para.size or 0.0)
+        if size_pt <= 0.0:
+            size_pt = 10.0
+        device_px = max(1.0, size_pt * self._zoom * dpr)
+        logical_px = max(1.0, round(device_px)) / dpr
+        dpi = float(self.logicalDpiY() or 72.0)
+        font.setPointSizeF(max(0.5, logical_px * 72.0 / dpi))
+        if run is not None:
+            font.setBold(bool(run.bold))
+            font.setItalic(bool(run.italic))
+        return font

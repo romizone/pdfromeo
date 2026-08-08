@@ -15,9 +15,18 @@ unparented worker QThread behind a modal indeterminate progress dialog
 (same ``_LIVE_THREADS`` pattern as app/ui/tools/base.py) so a 200 MB scan
 never freezes the GUI and cannot be mutated mid-save; ``is_busy()`` is
 truthful while one is in flight and gates every other mutation.
+
+Paragraph reflow (spec §10) joins that funnel as ``edit_paragraph``. Two
+things about it are not negotiable. First, the runs handed to the engine are
+DERIVED from the paragraph's own runs, so retyping one word in a paragraph
+does not flatten its inline bold into the body style. Second, a refusal is
+never softened: ``ok=False`` and ``missing_chars`` each get a dialog that
+names what went wrong and offers to reopen the editor, because the engine
+wrote nothing and the user's sentence exists only in this process.
 """
 from __future__ import annotations
 
+import copy
 import getpass
 import os
 import re
@@ -62,6 +71,93 @@ _COMMENT_MODES = frozenset({
     "ink", "rect", "ellipse", "line", "arrow", "redact",
 })
 
+# How long a one-off message stays in the status strip before the usual
+# page/zoom/modified readout comes back.
+_STATUS_MS = 8000
+
+_EDIT_TEXT_HINT = ("Edit Text: double-click a paragraph to retype it. "
+                   "Esc cancels, ⌘↩ commits.")
+
+
+def _same_style(a, b) -> bool:
+    """Two runs that can be merged back into one when text is spliced."""
+    return (a.font is b.font and abs(float(a.size) - float(b.size)) < 1e-6
+            and tuple(a.color) == tuple(b.color) and a.bold == b.bold
+            and a.italic == b.italic
+            and bool(getattr(a, "superscript", False))
+            == bool(getattr(b, "superscript", False)))
+
+
+def _runs_for_text(para, text: str) -> list:
+    """The paragraph's runs, re-cut to carry *text*.
+
+    A plain-text overlay cannot express inline styling, so the naive commit —
+    one run in the paragraph's first style — silently un-bolds every phrase in
+    a paragraph the user only fixed a typo in. Instead the unchanged head and
+    tail keep the runs they already had and only the span that actually
+    changed takes the style of the text immediately before it, which is what
+    a word processor does when you type into styled text.
+
+    ``raw_text`` is set to the text itself rather than sliced out of the
+    original: the emitter re-derives a missing glyph's de-normalised twin
+    (space -> U+00A0, hyphen -> U+00AD) itself, and slicing would need the two
+    strings to be the same length, which NUL-stripping does not guarantee.
+    """
+    runs = [run for run in para.runs if run.text]
+    if not runs:
+        return []
+    old = "".join(run.text for run in runs)
+    if text == old:
+        return [copy.copy(run) for run in runs]
+
+    limit = min(len(old), len(text))
+    head = 0
+    while head < limit and old[head] == text[head]:
+        head += 1
+    tail = 0
+    while (tail < limit - head
+            and old[len(old) - 1 - tail] == text[len(text) - 1 - tail]):
+        tail += 1
+
+    out: list = []
+
+    def emit(piece: str, run) -> None:
+        if not piece:
+            return
+        if out and _same_style(out[-1], run):
+            out[-1].text += piece
+            out[-1].raw_text += piece
+            return
+        fresh = copy.copy(run)
+        fresh.text = piece
+        fresh.raw_text = piece
+        out.append(fresh)
+
+    def spans(start: int, stop: int) -> None:
+        """Emit old[start:stop] with the styles it already had."""
+        at = 0
+        for run in runs:
+            end = at + len(run.text)
+            lo, hi = max(at, start), min(end, stop)
+            if lo < hi:
+                emit(run.text[lo - at:hi - at], run)
+            at = end
+
+    def run_owning(index: int):
+        at = 0
+        for run in runs:
+            at += len(run.text)
+            if index < at:
+                return run
+        return runs[-1]
+
+    spans(0, head)
+    middle = text[head:len(text) - tail]
+    if middle:
+        emit(middle, run_owning(max(0, head - 1)))
+    spans(len(old) - tail, len(old))
+    return out
+
 
 def _pretty_user() -> str:
     """macOS account name -> presentable default annotation author."""
@@ -93,6 +189,7 @@ class ToolsPane(QFrame):
     redact_requested = Signal()
     organize_requested = Signal()
     search_requested = Signal()
+    edit_text_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -115,6 +212,9 @@ class ToolsPane(QFrame):
         v.setSpacing(2)
 
         for text, tip, signal in (
+            ("✏️  Edit Text",
+             "Retype a paragraph in place; it re-wraps in its own font",
+             self.edit_text_requested),
             ("💬  Comment", "Annotate: highlights, notes, shapes, ink",
              self.comment_requested),
             ("⬛  Redact", "Mark and permanently remove content",
@@ -333,6 +433,14 @@ class DocumentWorkspace(QWidget):
             lambda _checked=False: self._set_view_mode("hand"))
         lay.addWidget(self._btn_hand)
 
+        self._btn_text = self._tbtn(
+            "Edit Text",
+            "Double-click a paragraph to retype it (Esc cancels, ⌘↩ commits)",
+            checkable=True)
+        self._btn_text.clicked.connect(
+            lambda _checked=False: self.open_text_editing())
+        lay.addWidget(self._btn_text)
+
         lay.addWidget(_v_sep())
 
         self._btn_comment = self._tbtn("💬 Comment", "Comment tools",
@@ -370,6 +478,12 @@ class DocumentWorkspace(QWidget):
         self._status_label = QLabel("")
         lay.addWidget(self._status_label)
         lay.addStretch(1)
+        # One shared timer, restarted per message: two messages in a row must
+        # not have the first one's expiry wipe the second one off the strip.
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(self._clear_status_message)
+        self._status_message = ""
         return frame
 
     def _wire_signals(self) -> None:
@@ -387,6 +501,8 @@ class DocumentWorkspace(QWidget):
         dv.annot_double_clicked.connect(self.edit_annotation)
         dv.annot_delete_requested.connect(self.delete_annotation)
         dv.mode_changed.connect(self._on_mode_changed)
+        dv.paragraph_edit_requested.connect(self._on_paragraph_edit_requested)
+        dv.paragraph_not_editable.connect(self._on_paragraph_not_editable)
 
         self.rail.panel_toggled.connect(self.toggle_panel)
 
@@ -404,6 +520,7 @@ class DocumentWorkspace(QWidget):
         pane.organize_requested.connect(
             lambda: self._open_panel(PANEL_THUMBS))
         pane.search_requested.connect(self.open_search)
+        pane.edit_text_requested.connect(self.open_text_editing)
 
     # ==================================================================
     # View plumbing (toolbar <-> docview)
@@ -420,7 +537,8 @@ class DocumentWorkspace(QWidget):
 
     def _sync_mode_buttons(self, mode: str) -> None:
         for btn, name in ((self._btn_select, "select"),
-                          (self._btn_hand, "hand")):
+                          (self._btn_hand, "hand"),
+                          (self._btn_text, "text")):
             blocked = btn.blockSignals(True)
             btn.setChecked(mode == name)
             btn.blockSignals(blocked)
@@ -525,7 +643,9 @@ class DocumentWorkspace(QWidget):
         blocked = self._btn_comment.blockSignals(True)
         self._btn_comment.setChecked(False)
         self._btn_comment.blockSignals(blocked)
-        if self.docview.mode() not in ("select", "hand"):
+        # 'text' joins select/hand as a mode the Comment toolbar does not own,
+        # so closing that toolbar must not drop the user out of it.
+        if self.docview.mode() not in ("select", "hand", "text"):
             self._set_view_mode("select")
         self.comment_toolbar.set_mode(self.docview.mode())
 
@@ -740,6 +860,149 @@ class DocumentWorkspace(QWidget):
                     page, xref, author or self._author)
 
         self._mutate(run, pages=[page])
+
+    # --- paragraph reflow (spec §10) ------------------------------------
+
+    def open_text_editing(self) -> None:
+        """Toolbar / Tools-pane entry point for the on-page text editor."""
+        self._set_view_mode("text")
+        if self.docview.mode() == "text":
+            self.show_status_message(_EDIT_TEXT_HINT)
+
+    def _on_paragraph_not_editable(self, page: int, reason: str) -> None:
+        """A paragraph failed the §8 gate. Say so, quietly.
+
+        The engine writes ``reason`` for the person who clicked, so it is
+        shown verbatim — and in the status strip rather than a dialog,
+        because declining to open an editor is not an error the user has to
+        acknowledge before doing anything else.
+        """
+        text = str(reason).strip()
+        self.show_status_message(
+            f"Page {int(page) + 1}: {text}" if text else
+            f"Page {int(page) + 1}: this text cannot be re-wrapped.")
+
+    def _on_paragraph_edit_requested(self, page: int, para_key,
+                                     text: str) -> None:
+        # Deferred for the same reason add_note_at is: this arrives from a
+        # mouse or key handler inside DocView, and edit_paragraph mutates the
+        # session and refreshes that very canvas.
+        QTimer.singleShot(
+            0, lambda: self.edit_paragraph(int(page), para_key, str(text)))
+
+    def edit_paragraph(self, page: int, para_key, text: str) -> bool:
+        """Re-wrap one paragraph to carry *text*. True when the page changed.
+
+        The whole operation is one session mutation and therefore one undo
+        step; on any refusal the document is untouched and the user is offered
+        their text back rather than losing it.
+        """
+        if self._busy:
+            return False
+        page = int(page)
+        try:
+            para = self._paragraph_for(page, para_key)
+        except EngineError as e:
+            QMessageBox.warning(self, "Edit Text", str(e))
+            return False
+        if para is None:
+            QMessageBox.warning(
+                self, "Edit Text",
+                f"That paragraph is no longer on page {page + 1}, so nothing "
+                "was changed. Click the paragraph again.")
+            return False
+        if not para.reflowable:
+            self._on_paragraph_not_editable(page, para.reason)
+            return False
+
+        text = str(text)
+        if not text.strip():
+            # The engine refuses this too, but its message is about `new_runs`
+            # and this one is about what the user just did.
+            QMessageBox.warning(
+                self, "Edit Text",
+                "A paragraph cannot be emptied — leave at least one word, or "
+                "remove it with the Redact tool.")
+            self.docview.open_paragraph_editor(page, para_key, para.text)
+            return False
+
+        runs = _runs_for_text(para, text)
+        if not runs:
+            QMessageBox.warning(
+                self, "Edit Text",
+                "This paragraph has no styled text to re-wrap, so nothing "
+                "was changed.")
+            return False
+
+        try:
+            result = self.session.reflow_paragraph(page, para, runs)
+        except EngineError as e:
+            QMessageBox.warning(self, "Edit Text", str(e))
+            return False
+
+        if not result.ok:
+            self._explain_reflow_refusal(page, para_key, text, result)
+            return False
+
+        self._after_mutation([page])
+        self.show_status_message(
+            f"Paragraph re-wrapped into {result.lines} "
+            f"line{'s' if result.lines != 1 else ''}.")
+        return True
+
+    def _paragraph_for(self, page: int, para_key):
+        """The live Paragraph a key names, or None if it is gone."""
+        if isinstance(para_key, (tuple, list)) and len(para_key) == 2:
+            index = int(para_key[1])
+        elif isinstance(para_key, int) and not isinstance(para_key, bool):
+            index = int(para_key)
+        else:
+            index = int(getattr(para_key, "index", -1))
+        if index < 0:
+            return None
+        found = self.session.paragraphs(page)
+        if index >= len(found):
+            return None
+        return found[index]
+
+    def _explain_reflow_refusal(self, page: int, para_key, text: str,
+                                result) -> None:
+        """Name what stopped the edit and offer the user their text back.
+
+        Nothing was written either way, so every button here is safe; the one
+        thing that must not happen is the text quietly disappearing, which is
+        why Cancel is the only path that does not lead back to the editor.
+        """
+        missing = list(result.missing_chars or [])
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Edit Text")
+        box.setText(result.message or
+                    "This paragraph could not be re-wrapped, so nothing was "
+                    "changed.")
+        remove_btn = None
+        if missing:
+            box.setInformativeText(
+                "Nothing was changed. Remove those characters, or edit the "
+                "text yourself — PdfRomeo never substitutes a different "
+                "letter for one the document's font is missing.")
+            noun = ("those characters" if len(missing) > 1
+                    else "that character")
+            remove_btn = box.addButton(f"Remove {noun}",
+                                       QMessageBox.ButtonRole.AcceptRole)
+        else:
+            box.setInformativeText("Nothing was changed.")
+        again_btn = box.addButton("Edit Again",
+                                  QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is remove_btn and remove_btn is not None:
+            stripped = "".join(ch for ch in text if ch not in set(missing))
+            self.edit_paragraph(page, para_key, stripped)
+            return
+        if clicked is again_btn:
+            self.docview.open_paragraph_editor(page, para_key, text)
 
     # --- redaction -----------------------------------------------------
 
@@ -1240,6 +1503,22 @@ class DocumentWorkspace(QWidget):
             modified = False
         self._btn_save.setEnabled(modified and not self._busy)
 
+    def show_status_message(self, message: str,
+                            msecs: int = _STATUS_MS) -> None:
+        """Put a one-off message in the status strip for a few seconds.
+
+        The strip already exists and is already the place the user looks for
+        document state, so a refusal to open the paragraph editor belongs
+        here rather than behind a dialog they have to dismiss.
+        """
+        self._status_message = str(message)
+        self._update_status()
+        self._status_timer.start(max(0, int(msecs)))
+
+    def _clear_status_message(self) -> None:
+        self._status_message = ""
+        self._update_status()
+
     def _update_status(self) -> None:
         count = max(1, self.docview.page_count())
         page = min(self.docview.current_page() + 1, count)
@@ -1249,5 +1528,11 @@ class DocumentWorkspace(QWidget):
         except EngineError:
             modified = False
         state = "modified" if modified else "saved"
-        self._status_label.setText(
-            f"page {page} of {count} · {zoom}% · {state}")
+        summary = f"page {page} of {count} · {zoom}% · {state}"
+        # A live message outranks the routine readout: _update_status runs on
+        # every scroll and every mutation, and without this the message the
+        # user was meant to read is gone before they can read it.
+        if self._status_message:
+            self._status_label.setText(f"{self._status_message}  —  {summary}")
+        else:
+            self._status_label.setText(summary)

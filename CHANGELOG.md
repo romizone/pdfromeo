@@ -1,5 +1,58 @@
 # Changelog
 
+## 2.1.0
+
+Editing text stops being "replace this fragment" and becomes "retype this
+paragraph". Double-click a paragraph, type, and the whole paragraph
+re-wraps — in the document's own font, at its own size, keeping its
+justification and its inline bold and italic.
+
+### What reflow does
+
+- **Word-like re-wrapping within a paragraph.** Add or remove words and the
+  lines break again around them, instead of the replacement being squeezed
+  into the box the old text happened to occupy.
+- **The document's own font.** Text is measured from the PDF's own width
+  tables and re-drawn using the page's existing font resources, so nothing
+  is re-embedded and the file does not grow with each edit. Until now every
+  edit was redrawn in a substituted base-14 face, which on a document set in
+  Georgia was 9% narrower and broke every line in a different place.
+- **Justification that actually justifies.** PyMuPDF's own justification is
+  silently a no-op for embedded fonts — it emits an operator that only
+  applies to single-byte encodings, while embedded TrueType is two-byte, so
+  lines quietly end ragged. Lines are broken and spaced here instead.
+- **Inline styling survives.** Fixing a typo in a paragraph no longer
+  flattens the bold phrase three words later: unchanged text keeps the runs
+  it already had.
+
+### What it refuses, and says so
+
+A paragraph is only offered for reflow when re-wrapping it is safe. Tables,
+dot-leader contents pages, rotated pages, multi-column layouts, invisible
+OCR text layers, letter-tracked display type, and paragraphs whose font
+cannot be measured are all declined with a plain-English reason. Typing a
+character the document's font does not contain is reported rather than
+silently substituted, and nothing is written.
+
+**This release never moves anything on the page.** If the re-wrapped text
+needs more room than the paragraph already has, the edit is declined and the
+document is left untouched. Pushing the content below a paragraph downwards
+is the one part of this feature whose failure would damage a document rather
+than refuse, so it lands separately once this foundation has proven itself.
+
+### Safety
+
+Every edit is checked before it is committed: the page's words are compared
+before and after, and if anything outside the edited paragraph moved or
+changed, the whole edit is rolled back. One reflow is one undo step.
+
+New modules: `app/engine/fontmetrics.py` (exact measurement from the PDF's
+own tables — accurate to 0.0001 pt across base-14, fully-embedded, subsetted
+and simple TrueType fonts), `app/engine/textblocks.py` (paragraph
+reconstruction — a PyMuPDF "block" is not a paragraph, in both directions),
+and `app/engine/reflow.py` (line breaking and content-stream emission).
+`tests/test_reflow.py` adds 151 checks.
+
 ## 2.0.0
 
 PdfRomeo stops being a rack of 43 separate tools and becomes a document
