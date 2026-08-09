@@ -1,10 +1,20 @@
 """Edit Text outlines: does picking the tool change the PAGE, not just a flag?
 
 Builds a real DocumentWorkspace on a document whose first page carries two
-genuinely reflowable paragraphs plus a ruled table, and whose second page is a
-scanned image with nothing editable at all. Then it asserts what the user is
-supposed to see: outlines on exactly the editable paragraphs, none on the
-table, a hover that moves, and an empty page that says so.
+genuinely reflowable paragraphs plus a ruled table, whose second page is a
+scanned image with nothing editable at all, and whose third page carries two
+more paragraphs. Then it asserts what the user is supposed to see: outlines on
+exactly the editable paragraphs, none on the table, a hover that moves, and an
+empty page that says so.
+
+The last section is the one that matters most, because it is the bug the user
+actually hit: **more than one edit in a row**. It drives REAL double clicks —
+press, release, MouseButtonDblClick, release, the four events Qt really sends
+— and edits a paragraph, then its neighbour on the same page, then one on
+another page, without pressing ⌘↩ in between, which is how anybody actually
+uses the tool. Calling the opener directly cannot see that bug: the press is
+what commits the previous overlay, and it is the interaction between that
+commit and the double click behind it that used to throw the gesture away.
 
 The offscreen harness's async page renderer often never delivers here (the
 page slot stays empty), so every assertion reads the view's own state rather
@@ -69,8 +79,40 @@ def _table(page: "fitz.Page", top: float) -> None:
     writer.write_text(page, color=(0.0, 0.0, 0.0))
 
 
+SECOND_PAGE_BODIES = (
+    "The committee reviewed each submission in turn and agreed that the "
+    "revised schedule should be circulated before the end of the quarter so "
+    "that every department has time to respond in writing.",
+    "Costs were held within the envelope agreed in March, and the small "
+    "overrun on travel was offset by lower spending on external advice "
+    "during the second half of the year.",
+)
+
+
+def _plain_paragraphs(doc, bodies) -> None:
+    """A page of ordinary reflowable paragraphs, one per body."""
+    page = doc.new_page(width=595, height=842)
+    regular = fitz.Font(fontfile=fx.GEORGIA)
+    bold = fitz.Font(fontfile=fx.GEORGIA_BOLD)
+    space = regular.text_length(" ", fx.SIZE)
+    writer = fitz.TextWriter(page.rect)
+    y = fx.TOP
+    for body in bodies:
+        y = fx._write_paragraph(
+            writer,
+            fx._wrap(fx._tokens([(body, 0)], (regular, bold)), fx.SIZE,
+                     fx.WIDTH, space),
+            y)
+        y += 26.0
+    writer.write_text(page, color=(0.0, 0.0, 0.0))
+
+
 def build_pdf(path: str) -> None:
-    """Page 1: two reflowable paragraphs + a ruled table. Page 2: an image."""
+    """Page 1: two reflowable paragraphs + a ruled table. Page 2: an image.
+
+    Page 3 carries two more paragraphs, so "edit something on another page"
+    is a case this document can actually pose.
+    """
     doc = fitz.open()
     page = doc.new_page(width=595, height=842)
     regular = fitz.Font(fontfile=fx.GEORGIA)
@@ -95,6 +137,8 @@ def build_pdf(path: str) -> None:
     pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 400, 500))
     pix.set_rect(pix.irect, (235, 235, 235))
     scan.insert_image(fitz.Rect(80, 120, 480, 620), pixmap=pix)
+
+    _plain_paragraphs(doc, SECOND_PAGE_BODIES)
     doc.save(path)
     doc.close()
 
@@ -141,6 +185,73 @@ def accent_pixels(dv, page: int) -> int:
     return hits
 
 
+def settle(app, ticks: int = 60) -> None:
+    """Pump unconditionally: queued mutations, their refresh, the idle scan.
+
+    ``drain`` returns the moment the outline queue is empty, which right after
+    a commit it already is — so it can return BEFORE the edit has landed.
+    """
+    for _ in range(ticks):
+        app.processEvents()
+        time.sleep(0.005)
+
+
+def widget_point(dv, page: int, x_pt: float, y_pt: float):
+    """A DISPLAYED-space point on a page -> a point on the canvas widget.
+
+    ``dv._geo[page]`` is a QRectF in the pages widget's own coordinates, which
+    is also what ``_page_at`` maps back, so this is the round trip the real
+    mouse makes.
+    """
+    from PySide6.QtCore import QPointF
+    geo = dv._geo[page]
+    return QPointF(geo.x() + x_pt * dv.zoom(), geo.y() + y_pt * dv.zoom())
+
+
+def double_click(ws, page: int, x_pt: float, y_pt: float) -> None:
+    """A REAL double click on the canvas at a DISPLAYED-space point.
+
+    Qt sends four events for one double click: press, release, DblClick,
+    release. Sending only the DblClick — or calling the opener directly —
+    skips the press, and the press is what commits an overlay that is still
+    open by taking its focus. The bug this guards lived exactly in what those
+    two do to each other, so all four are sent, in order.
+    """
+    from PySide6.QtCore import QEvent, QPoint, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    dv = ws.docview
+    pos = widget_point(dv, page, x_pt, y_pt)
+    gpos = dv._pages.mapToGlobal(QPoint(0, 0)) + pos.toPoint()
+    left = Qt.MouseButton.LeftButton
+    nothing = Qt.MouseButton.NoButton
+    mods = Qt.KeyboardModifier.NoModifier
+    for kind, held, handler in (
+            (QEvent.Type.MouseButtonPress, left, dv._pages.mousePressEvent),
+            (QEvent.Type.MouseButtonRelease, nothing,
+             dv._pages.mouseReleaseEvent),
+            (QEvent.Type.MouseButtonDblClick, left,
+             dv._pages.mouseDoubleClickEvent),
+            (QEvent.Type.MouseButtonRelease, nothing,
+             dv._pages.mouseReleaseEvent)):
+        handler(QMouseEvent(kind, pos, gpos, left, held, mods))
+
+
+def press_commit(ws) -> None:
+    """⌘↩ inside the overlay (macOS maps ⌘ onto ControlModifier)."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    ws.docview._editor.keyPressEvent(
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return,
+                  Qt.KeyboardModifier.ControlModifier, "\r"))
+
+
+def type_marker(ws, marker: str) -> None:
+    """Append a marker to whatever the overlay is holding."""
+    dv = ws.docview
+    dv._editor.setPlainText(f"{dv.paragraph_editor_text()} {marker}.")
+
+
 def move_to(ws, page: int, x_pt: float, y_pt: float) -> None:
     """Synthesise a hover at a DISPLAYED-space point on a page."""
     from PySide6.QtCore import QPoint, QPointF, Qt
@@ -155,6 +266,135 @@ def move_to(ws, page: int, x_pt: float, y_pt: float) -> None:
                         Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
                         Qt.KeyboardModifier.NoModifier)
     dv._pages.mouseMoveEvent(event)
+
+
+def _stub_modals():
+    """Record dialogs instead of showing them, and hand back an undo.
+
+    Nothing in this run is supposed to raise one; a real modal would block the
+    offscreen run forever rather than fail it, so they are recorded and then
+    asserted to be absent.
+    """
+    from PySide6.QtWidgets import QMessageBox
+    seen: list[str] = []
+    saved = {}
+    for name in ("information", "warning", "critical", "question"):
+        saved[name] = getattr(QMessageBox, name)
+        setattr(QMessageBox, name, staticmethod(
+            lambda *a, _n=name, **k: seen.append(
+                f"{_n}: {a[2] if len(a) > 2 else ''}")))
+    saved["exec"] = QMessageBox.exec
+    QMessageBox.exec = lambda self, *a, **k: seen.append(
+        f"exec: {self.text()}")
+
+    def restore() -> None:
+        for name, original in saved.items():
+            setattr(QMessageBox, name, original)
+
+    return seen, restore
+
+
+def edit_after_edit(app, ws, session) -> None:
+    """Three edits in a row, by real double click. THE bug of v2.2.1.
+
+    Reported as "habis edit text halaman 1 ... ndak bisa edit text lainnya":
+    the first paragraph edits fine and nothing afterwards does. Every edit
+    after the first begins with a press that commits the previous overlay by
+    taking its focus, so the double click that press belongs to used to be
+    thrown away, and the user got no editor — on that paragraph, its
+    neighbour, or one on another page.
+
+    Nothing is committed with ⌘↩ except the last one, because that is how the
+    tool is used: you finish a paragraph by starting the next.
+    """
+    dv = ws.docview
+    seen, restore_modals = _stub_modals()
+    try:
+        print("\nOne edit after another, by real double click:")
+        ws.open_text_editing()
+        drain(app, ws)
+
+        def centres(page):
+            dv.goto_page(page)
+            drain(app, ws)
+            settle(app, 20)
+            return [((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+                    for b in sorted(dv.editable_paragraph_boxes(page),
+                                    key=lambda b: b[1])]
+
+        first_page = centres(0)
+        other_page = centres(2)
+        check("page 1 offers two paragraphs to edit in turn",
+              len(first_page) >= 2, f"{len(first_page)} outlines")
+        check("page 3 offers a paragraph to edit after them",
+              len(other_page) >= 1, f"{len(other_page)} outlines")
+        if len(first_page) < 2 or not other_page:
+            return
+
+        dv.goto_page(0)
+        drain(app, ws)
+        plan = ((0, first_page[0], "ALPHA"),
+                (0, first_page[1], "BRAVO"),
+                (2, other_page[0], "CHARLIE"))
+        opened_on = []
+        for n, (page, (x, y), marker) in enumerate(plan, start=1):
+            where = ("the first paragraph on page 1",
+                     "its neighbour on the SAME page",
+                     "a paragraph on ANOTHER page")[n - 1]
+            dv.goto_page(page)
+            double_click(ws, page, x, y)
+            # The gesture may have to wait for the previous edit to land, so
+            # it is judged after the loop turns — not never.
+            settle(app, 40)
+            editing = dv.editing_paragraph()
+            check(f"edit {n} opens an overlay on {where}",
+                  editing is not None and editing[0] == page,
+                  f"editing_paragraph() = {editing}")
+            if editing is None:
+                return
+            carried = dv.paragraph_editor_text()
+            # Each edit must land on a paragraph of its own. If the double
+            # click had re-opened the paragraph just edited, its marker would
+            # be sitting in the editor.
+            check(f"edit {n} opens a paragraph none of the others touched",
+                  not any(m in carried for _p, _c, m in plan[:n - 1]),
+                  f"editor already holds {carried[-40:]!r}")
+            opened_on.append(editing)
+            type_marker(ws, marker)
+            if n == len(plan):
+                press_commit(ws)
+        settle(app, 60)
+
+        check("the three edits opened three different paragraphs",
+              len(set(opened_on)) == 3, str(opened_on))
+
+        pages = {p: session.paragraphs(p) for p in (0, 2)}
+        found = {}
+        for page, paras in pages.items():
+            for para in paras:
+                for marker in ("ALPHA", "BRAVO", "CHARLIE"):
+                    if marker in para.text:
+                        found.setdefault(marker, []).append(
+                            (page, para.index, para.text.count(marker)))
+        for marker, page in (("ALPHA", 0), ("BRAVO", 0), ("CHARLIE", 2)):
+            hits = found.get(marker, [])
+            check(f"{marker} is in the document, on page {page + 1}",
+                  len(hits) == 1 and hits[0][0] == page, str(hits))
+            check(f"{marker} was applied exactly once",
+                  bool(hits) and hits[0][2] == 1, str(hits))
+
+        # The whole complaint is that later edits do not stick; the mirror of
+        # it is an earlier edit being rolled back by a later one, which a
+        # replayed gesture could plausibly cause.
+        homes = {m: h[0][:2] for m, h in found.items() if h}
+        check("no two edits landed in the same paragraph",
+              len(set(homes.values())) == len(homes), str(homes))
+        check("the edit made before these three is still there",
+              any("Verified." in p.text for p in pages[0]),
+              str([p.text[-24:] for p in pages[0]]))
+        check("no dialog interrupted any of it", not seen, str(seen))
+    finally:
+        restore_modals()
 
 
 def main() -> int:
@@ -437,6 +677,8 @@ def main() -> int:
         check("outlines come back after the commit's refresh",
               len(dv.editable_paragraph_boxes(0)) >= 1,
               str(dv.editable_paragraph_boxes(0)))
+
+    edit_after_edit(app, ws, session)
 
     dv.set_session(None)
     app.processEvents()

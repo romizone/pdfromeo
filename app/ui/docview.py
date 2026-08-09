@@ -403,8 +403,25 @@ class DocView(QWidget):
         self._editor: _ParagraphEditor | None = None
         self._edit_para = None              # engine textblocks.Paragraph
         self._edit_chrome = (0, 0, 0, 0)
-        self._edit_settling = False
         self._placing_editor = False
+        # A commit's mutation is queued but has not landed yet. Every edit
+        # after the first starts with a press that commits the previous
+        # overlay by taking its focus, so the double click that press belongs
+        # to arrives while this is set — and an overlay opened then would be
+        # destroyed by the mutation's own refresh() a moment later.
+        # Two things are cleared where they used to be one, deliberately:
+        # refresh() lowers this when the mutation lands, and the START of the
+        # next press lowers it unconditionally. Nothing here waits on a timer,
+        # because a flag only a timer can lower is one missed timer away from
+        # a viewer that refuses to open an editor ever again — and that
+        # failure is invisible: a double click that does nothing at all.
+        self._commit_pending = False
+        # (page, x_pt, y_pt, paragraph text) of a double click that arrived
+        # during that window. The gesture is honoured once the page is whole
+        # again rather than thrown away — throwing it away is precisely what
+        # the user met as "after editing one paragraph you cannot edit
+        # another, on this page or any other".
+        self._deferred_edit: tuple[int, float, float, str] | None = None
 
         # Edit-Text outlines. `_para_boxes` maps a page to the displayed-space
         # boxes of the paragraphs it will actually let you edit. A present but
@@ -517,6 +534,10 @@ class DocView(QWidget):
 
     def _reset_state(self) -> None:
         self._destroy_editor()
+        # A click aimed at the document being replaced must not be replayed
+        # onto the one taking its place.
+        self._commit_pending = False
+        self._deferred_edit = None
         self._invalidate_paragraph_outlines()
         self._cache.clear()
         self._cache_bytes = 0
@@ -634,6 +655,9 @@ class DocView(QWidget):
         """Re-render after a session mutation; keeps the scroll anchor."""
         if self._session is None:
             return
+        # The mutation a commit queued has landed, so the window in which a
+        # double click had to be held back is over — whether or not one was.
+        self._commit_pending = False
         # A mutation re-numbers paragraphs (Paragraph.index is an ordinal), so
         # an overlay that outlived one would be pointing at whatever paragraph
         # inherited its number. Close it without committing: the edit that
@@ -681,6 +705,11 @@ class DocView(QWidget):
             self._emit_selection_state()
         self._schedule_visible()
         self._pages.update()
+        # Last, on a page that is whole again: the double click the user made
+        # while this mutation was in flight. Geometry has been recomputed, so
+        # the overlay can be placed, and _destroy_editor() above cannot reach
+        # an editor opened from here.
+        self._open_deferred_edit()
 
     def goto_page(self, index: int) -> None:
         if not self._geo:
@@ -1038,6 +1067,12 @@ class DocView(QWidget):
     def _canvas_press(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        # A new press is a new gesture, so nothing an older one left in flight
+        # may still suppress it. This runs BEFORE setFocus() on purpose: taking
+        # the focus is what commits an open overlay, and the flag that commit
+        # sets has to survive into the double click of THIS gesture.
+        self._commit_pending = False
+        self._deferred_edit = None
         self.setFocus()
         if self._session is None or not self._geo:
             return
@@ -1293,14 +1328,17 @@ class DocView(QWidget):
             # §10: the press that opened this double click already committed
             # any overlay it took the focus from, and that commit is a session
             # mutation still queued behind us. Opening a second overlay now
-            # would only have it torn down by that mutation's refresh.
-            if not self._edit_settling:
-                if self._begin_paragraph_edit(page, px, py):
-                    # No triple-click state is armed: the overlay now covers
-                    # this spot, so a third click belongs to IT, and leaving
-                    # `_last_double` set would make a click somewhere else
-                    # select a line on the page behind the editor instead.
-                    return
+            # would only have it torn down by that mutation's refresh — so the
+            # gesture is REMEMBERED and replayed by refresh(), not dropped.
+            if self._commit_pending:
+                self._arm_deferred_edit(page, px, py)
+                return
+            if self._begin_paragraph_edit(page, px, py):
+                # No triple-click state is armed: the overlay now covers this
+                # spot, so a third click belongs to IT, and leaving
+                # `_last_double` set would make a click somewhere else select
+                # a line on the page behind the editor instead.
+                return
         if self._mode == "text":
             return
         if self._mode == "select":
@@ -2022,16 +2060,73 @@ class DocView(QWidget):
         # turn of the event loop later; until then the outline of the
         # paragraph that just changed would still be drawn at its old size.
         self._invalidate_paragraph_outlines([page])
-        self._edit_settling = True
-        # Cleared behind whatever the listener queues for itself, so a double
-        # click arriving in the same gesture cannot open an overlay that the
-        # pending mutation would immediately close again.
+        # Raised before the emit, because a listener is entitled to mutate the
+        # session synchronously; lowered by refresh() when the mutation lands,
+        # or by the next press if it never does.
+        self._commit_pending = True
         self.paragraph_edit_requested.emit(page, key, text)
-        QTimer.singleShot(0, self._clear_edit_settling)
         return True
 
-    def _clear_edit_settling(self) -> None:
-        self._edit_settling = False
+    # --- a double click that had to wait for the previous edit -------------
+
+    def _arm_deferred_edit(self, page: int, px: float, py: float) -> None:
+        """Remember the paragraph a double click asked for, to open it later.
+
+        The point is resolved NOW, against the session as it still stands,
+        because that is the page the user was looking at when they clicked.
+        The paragraph's TEXT is what gets remembered rather than its key: a
+        reflow renumbers a page's paragraphs (the one just edited can come
+        back with a different ordinal), so the ordinal would name the wrong
+        paragraph by the time this is replayed.
+        """
+        session = self._session
+        if session is None:
+            return
+        try:
+            para = session.paragraph_at(page, px, py)
+        except EngineError:
+            return
+        if para is None:
+            return
+        if not para.reflowable:
+            # Same answer the user would have got without the wait.
+            self.paragraph_not_editable.emit(
+                int(page), para.reason or _NOT_EDITABLE)
+            return
+        self._deferred_edit = (int(page), float(px), float(py), para.text)
+
+    def _open_deferred_edit(self) -> None:
+        """Replay that double click now the page has been rebuilt."""
+        pending = self._deferred_edit
+        self._deferred_edit = None
+        # The same modes that honour the double click honour its replay; if
+        # the user has moved on to another tool, their click is stale.
+        if (pending is None or self._editor is not None
+                or self._mode not in ("select", "text")):
+            return
+        session = self._session
+        if session is None:
+            return
+        page, px, py, wanted = pending
+        if page >= len(self._geo):
+            return
+        try:
+            para = session.paragraph_at(page, px, py)
+            if para is None or para.text != wanted:
+                # The edit that just landed may have pushed this paragraph
+                # down the page, so the point can now name its neighbour.
+                # Identity is the text the user pointed at, not the spot.
+                para = next((p for p in session.paragraphs(page)
+                             if p.text == wanted), None)
+        except EngineError:
+            return
+        # Nothing matched: the paragraph the user aimed at no longer exists in
+        # that form. Opening its neighbour instead would edit the wrong words,
+        # so this quietly does nothing and leaves the (repainted, correct)
+        # outlines for the user to click again.
+        if para is None or not para.reflowable:
+            return
+        self._open_editor(para)
 
     @Slot()
     def _on_editor_commit(self) -> None:

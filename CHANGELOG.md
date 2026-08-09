@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.2.2
+
+Fixes Edit Text only working once. After editing one paragraph, the
+double-click that should have started the next edit — on the same page or
+any other — did nothing at all, with no message.
+
+Qt delivers a double-click as press, release, double-click. When an overlay
+is already open, the press moves the focus, the focus change commits that
+overlay, and the commit raised a latch meant to stop a stale gesture from
+opening an editor the pending refresh would immediately tear down. The
+double-click that follows arrives in the same burst, before any timer can
+lower that latch, so the guard never caught a stale gesture — it caught the
+live one, every time. The first edit worked only because there was no
+earlier overlay to commit.
+
+The latch could not simply be deleted: without it, the second overlay opens
+and the previous edit's own refresh destroys it microseconds later, losing
+whatever was typed. So the gesture is now held and REPLAYED once the page
+is whole again, rather than dropped. The held click remembers the
+paragraph's text rather than its position in the page, because committing
+an edit renumbers a page's paragraphs and a stored index would replay into
+the wrong words.
+
+The new state also cannot wedge: it is cleared both when the mutation lands
+and unconditionally at the start of the next click, so no missed timer can
+leave the viewer permanently refusing to edit.
+
+`tests/test_edit_text_ui.py` grows to 57 checks, including three
+consecutive edits driven by real double-clicks across two pages — a test
+that fails against the previous release.
+
 ## 2.2.1
 
 Edit Text now looks like editing the page, rather than a dialog dropped on
