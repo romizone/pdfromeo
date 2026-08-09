@@ -75,8 +75,15 @@ _COMMENT_MODES = frozenset({
 # page/zoom/modified readout comes back.
 _STATUS_MS = 8000
 
-_EDIT_TEXT_HINT = ("Edit Text: double-click a paragraph to retype it. "
-                   "Esc cancels, ⌘↩ commits.")
+_EDIT_TEXT_HINT = ("Edit Text: double-click an outlined paragraph to retype "
+                   "it. Esc cancels, ⌘↩ commits.")
+# A page of scanned images, tables or rotated text offers no paragraph at all.
+# Saying nothing there leaves the user double-clicking a page that will never
+# respond, which reads as a broken tool rather than an honest refusal.
+_EDIT_TEXT_EMPTY = ("Edit Text: nothing on this page can be re-wrapped — "
+                    "scanned pages, tables and rotated text are left as they "
+                    "are.")
+_TEXT_HINTS = frozenset({_EDIT_TEXT_HINT, _EDIT_TEXT_EMPTY})
 
 
 def _same_style(a, b) -> bool:
@@ -503,6 +510,7 @@ class DocumentWorkspace(QWidget):
         dv.mode_changed.connect(self._on_mode_changed)
         dv.paragraph_edit_requested.connect(self._on_paragraph_edit_requested)
         dv.paragraph_not_editable.connect(self._on_paragraph_not_editable)
+        dv.paragraph_outlines_ready.connect(self._on_paragraph_outlines_ready)
 
         self.rail.panel_toggled.connect(self.toggle_panel)
 
@@ -566,6 +574,9 @@ class DocumentWorkspace(QWidget):
     def _on_page_changed(self, page: int) -> None:
         self._page_edit.setText(str(page + 1))
         self._update_status()
+        # Scrolling onto a page with nothing editable has to say so too, or
+        # the hint keeps promising paragraphs that are not there.
+        self._show_text_mode_hint(page)
 
     def _on_zoom_combo(self) -> None:
         text = self._zoom_combo.currentText().strip().rstrip("%").strip()
@@ -866,8 +877,32 @@ class DocumentWorkspace(QWidget):
     def open_text_editing(self) -> None:
         """Toolbar / Tools-pane entry point for the on-page text editor."""
         self._set_view_mode("text")
-        if self.docview.mode() == "text":
-            self.show_status_message(_EDIT_TEXT_HINT)
+        if self.docview.mode() != "text":
+            return
+        # The user just picked the tool, so this hint outranks whatever was in
+        # the strip; _show_text_mode_hint then corrects it once the outline
+        # scan for this page lands (it may already have).
+        self.show_status_message(_EDIT_TEXT_HINT)
+        self._show_text_mode_hint(self.docview.current_page())
+
+    def _show_text_mode_hint(self, page: int) -> None:
+        """Keep the Edit Text hint honest about the page being looked at."""
+        if self.docview.mode() != "text":
+            return
+        # Never talk over a message about something the user just DID — a
+        # commit's "re-wrapped into 3 lines", a §8 refusal. Only the standing
+        # hint, or an empty strip, is ours to replace.
+        if self._status_message and self._status_message not in _TEXT_HINTS:
+            return
+        count = self.docview.editable_paragraph_count(page)
+        # `None` is "not scanned yet", not "none": the generic hint stands
+        # until the scan actually answers.
+        self.show_status_message(
+            _EDIT_TEXT_EMPTY if count == 0 else _EDIT_TEXT_HINT)
+
+    def _on_paragraph_outlines_ready(self, page: int, _count: int) -> None:
+        if int(page) == self.docview.current_page():
+            self._show_text_mode_hint(int(page))
 
     def _on_paragraph_not_editable(self, page: int, reason: str) -> None:
         """A paragraph failed the §8 gate. Say so, quietly.

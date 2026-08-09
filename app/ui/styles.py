@@ -34,6 +34,7 @@ BG_RAISED     = "#323236"     # hover targets, inputs
 BG_HOVER      = "#3a3a40"     # hover tint
 BG_SELECTED   = "#1f3a5f"     # selection tint
 CANVAS        = "#19191c"     # document canvas behind pages
+PAPER         = "#ffffff"     # the page itself — chrome stops at its edge
 BORDER        = "#3d3d42"     # default border
 BORDER_STRONG = "#4a4a52"     # emphasized border
 TEXT_PRIMARY  = "#e8e8ea"     # body text
@@ -368,6 +369,22 @@ QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus,
 QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
     border-color: {BORDER_FOCUS};
+}}
+/* The paragraph editor is the one input that must NOT look like an input.
+   It sits on the page, over the words it replaces, so it takes the paper's
+   colour rather than the theme's — the dark field, the 8px radius and above
+   all the 12px padding of the rule above made it a dialog dropped onto the
+   document, and shunted the text sideways the moment it opened. Padding is
+   zero so the glyphs stay exactly where they were; the accent hairline is
+   the only sign that typing is now live. Text colour is set in code, from
+   the paragraph's own runs. */
+QTextEdit#ParagraphEditor {{
+    background: {PAPER};
+    border: 1px solid {ACCENT};
+    border-radius: 2px;
+    padding: 0px;
+    selection-background-color: {ACCENT};
+    selection-color: white;
 }}
 QComboBox::drop-down {{
     border: none;

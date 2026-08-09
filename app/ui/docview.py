@@ -42,8 +42,8 @@ from PySide6.QtCore import (
     Slot,
 )
 from PySide6.QtGui import (
-    QColor, QFont, QGuiApplication, QImage, QPainter, QPen, QTextCursor,
-    QTextOption,
+    QColor, QFont, QGuiApplication, QImage, QPainter, QPen, QTextCharFormat,
+    QTextCursor, QTextOption,
 )
 from PySide6.QtWidgets import (
     QFrame, QScrollArea, QTextEdit, QVBoxLayout, QWidget,
@@ -97,12 +97,30 @@ _NOT_EDITABLE = ("This part of the page cannot be re-wrapped, so it was left "
                  "unchanged.")
 _MIN_EDITOR_PX = 8      # a degenerate bbox must still give a clickable box
 
+# Edit-Text affordance. session.paragraphs() is deliberately uncached and
+# re-detects on every call, so it can never be reached from paintEvent; the
+# boxes are detected off the paint path, one page per idle tick, and cached
+# here. The cadence matches the thumbnail panel's for the same reason: a
+# detection is tens of milliseconds, which is longer than a frame.
+_PARA_TICK_MS = 30
+_PARA_BATCH = 1         # pages detected per tick
+_PARA_PAD = 2.0         # px of air between the glyphs and their outline
+_PARA_RADIUS = 3.0
+
 # Painting colours (painting is not stylesheet territory).
 _PAGE_FILL = QColor("#ffffff")
 _PAGE_BORDER = QColor(0, 0, 0, 90)
 _PAGE_SHADOW = QColor(0, 0, 0, 110)
 _SEARCH_FILL = QColor(255, 235, 59, 90)
 _SEARCH_CURRENT = QColor(255, 150, 50, 130)
+# Resting outlines have to survive on white paper without competing with the
+# text they surround; the hovered one has to win against all of them at once.
+_PARA_EDGE = QColor(ACCENT)
+_PARA_EDGE.setAlpha(105)
+_PARA_EDGE_HOVER = QColor(ACCENT)
+_PARA_EDGE_HOVER.setAlpha(235)
+_PARA_WASH = QColor(ACCENT)
+_PARA_WASH.setAlpha(28)
 
 
 class _Req:
@@ -195,10 +213,17 @@ class _PagesWidget(QWidget):
         super().__init__()
         self._owner = owner
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        # Edit Text has to answer "is this bit editable?" before the user
+        # commits to a double click, which needs moves with no button down.
+        self.setMouseTracking(True)
 
     # Everything is delegated: the owner has all the state.
     def paintEvent(self, event) -> None:  # type: ignore[override]
         self._owner._paint_pages(self, event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        self._owner._clear_paragraph_hover()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         self._owner._canvas_press(event)
@@ -306,6 +331,8 @@ class DocView(QWidget):
     paragraph_edit_requested = Signal(int, object, str)
     # §10: the paragraph failed the §8 gate. (page, its own `reason`)
     paragraph_not_editable = Signal(int, str)
+    # §10: a page's editable-paragraph scan landed. (page, how many)
+    paragraph_outlines_ready = Signal(int, int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -378,6 +405,20 @@ class DocView(QWidget):
         self._edit_chrome = (0, 0, 0, 0)
         self._edit_settling = False
         self._placing_editor = False
+
+        # Edit-Text outlines. `_para_boxes` maps a page to the displayed-space
+        # boxes of the paragraphs it will actually let you edit. A present but
+        # EMPTY list is the answer "this page offers nothing" — a different
+        # thing from a missing key, which means "not looked at yet", and the
+        # difference is what the status hint is allowed to claim.
+        self._para_boxes: dict[int, list[tuple]] = {}
+        self._para_queue: list[int] = []
+        self._para_hover: tuple[int, int] | None = None
+        self._para_scans = 0                # pages detected this session
+        self._para_scan_secs = 0.0          # wall clock spent detecting them
+        self._para_timer = QTimer(self)
+        self._para_timer.setInterval(_PARA_TICK_MS)
+        self._para_timer.timeout.connect(self._detect_paragraph_batch)
 
         # --- widgets
         self._scroll = QScrollArea()
@@ -476,6 +517,7 @@ class DocView(QWidget):
 
     def _reset_state(self) -> None:
         self._destroy_editor()
+        self._invalidate_paragraph_outlines()
         self._cache.clear()
         self._cache_bytes = 0
         self._page_slot.clear()
@@ -603,6 +645,11 @@ class DocView(QWidget):
             self._queue.clear()
         self._pending.clear()
         had_selection = self.has_selection()
+        # A mutation can add, remove or re-wrap paragraphs, so every cached
+        # box on an affected page is a guess about a page that no longer
+        # exists — and an outline in the wrong place invites a double click
+        # onto the wrong paragraph.
+        self._invalidate_paragraph_outlines(pages)
         if pages is None:
             self._cache.clear()
             self._cache_bytes = 0
@@ -800,7 +847,12 @@ class DocView(QWidget):
         self._cancel_drag()
         self._flush_ink()           # a mode switch commits pending strokes
         self._mode = mode
+        # Both directions matter: entering 'text' must scan, and leaving it
+        # must take the outlines off the page in the same repaint rather than
+        # leaving them to fade out on the next scroll.
+        self._invalidate_paragraph_outlines()
         self._apply_cursor()
+        self._schedule_paragraph_scan()
         self.mode_changed.emit(mode)
         self._pages.update()
 
@@ -810,7 +862,11 @@ class DocView(QWidget):
     def _apply_cursor(self) -> None:
         cursors = {
             "select": Qt.CursorShape.IBeamCursor,
-            "text": Qt.CursorShape.IBeamCursor,
+            # 'text' is deliberately NOT an I-beam here: in Edit Text only the
+            # outlined paragraphs can be typed into, so the beam is earned per
+            # paragraph by _update_paragraph_hover and the arrow is the honest
+            # answer everywhere else.
+            "text": Qt.CursorShape.ArrowCursor,
             "hand": Qt.CursorShape.OpenHandCursor,
             "note": Qt.CursorShape.PointingHandCursor,
         }
@@ -1081,6 +1137,9 @@ class DocView(QWidget):
 
     def _canvas_move(self, event) -> None:
         if self._drag_kind is None:
+            # Mouse tracking means this is every move over the canvas, so the
+            # hover test reads the cached boxes and never the session.
+            self._update_paragraph_hover(event.position())
             return
         pos = event.position()
         if not self._drag_moved:
@@ -1476,6 +1535,9 @@ class DocView(QWidget):
         vis = self._visible_range()
         if vis is None:
             return
+        # Every route that changes what is on screen already comes through
+        # here, so this is the one place the outline scan has to be armed.
+        self._schedule_paragraph_scan(vis)
         first, last = vis
         dpr = self.devicePixelRatioF() or 1.0
         prefetch = 0 if self._zoom > _CLIP_ZOOM else _PREFETCH
@@ -1678,11 +1740,46 @@ class DocView(QWidget):
 
         painter.save()
         painter.setClipRect(rect)
+        # Before the cover, so the paragraph being edited is left blank rather
+        # than showing an outline the overlay's own border already draws.
+        self._paint_paragraph_outlines(painter, page)
         self._paint_edit_cover(painter, page)
         self._paint_search(painter, page)
         self._paint_selection(painter, page)
         self._paint_annot_outline(painter, page)
         self._paint_drag_overlays(painter, page)
+        painter.restore()
+
+    def _paint_paragraph_outlines(self, painter: QPainter,
+                                  page: int) -> None:
+        """Show on the page itself which paragraphs Edit Text will take.
+
+        Without this the mode changes nothing the user can see: it only sets
+        a mode flag and prints a hint, so the page looks exactly as it did
+        and the tool reads as broken. Only paragraphs that PASS the §8 gate
+        are outlined — an outline the double click would then decline is a
+        promise the mode cannot keep.
+        """
+        if self._mode != "text":
+            return
+        boxes = self._para_boxes.get(page)
+        if not boxes:
+            return
+        hovered = -1
+        if self._para_hover is not None and self._para_hover[0] == page:
+            hovered = self._para_hover[1]
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        for i, box in enumerate(boxes):
+            widget_rect = self._pt_rect_to_widget(page, box).adjusted(
+                -_PARA_PAD, -_PARA_PAD, _PARA_PAD, _PARA_PAD)
+            if i == hovered:
+                painter.setPen(QPen(_PARA_EDGE_HOVER, 1.6))
+                painter.setBrush(_PARA_WASH)
+            else:
+                painter.setPen(QPen(_PARA_EDGE, 1.0))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(widget_rect, _PARA_RADIUS, _PARA_RADIUS)
         painter.restore()
 
     def _paint_edit_cover(self, painter: QPainter, page: int) -> None:
@@ -1921,6 +2018,10 @@ class DocView(QWidget):
         self._destroy_editor()
         if not commit:
             return True
+        # The commit's own refresh() will invalidate too, but it arrives a
+        # turn of the event loop later; until then the outline of the
+        # paragraph that just changed would still be drawn at its old size.
+        self._invalidate_paragraph_outlines([page])
         self._edit_settling = True
         # Cleared behind whatever the listener queues for itself, so a double
         # click arriving in the same gesture cannot open an overlay that the
@@ -2014,6 +2115,12 @@ class DocView(QWidget):
         # and would win over setFont(), but it never reaches the document.
         editor.document().setDefaultFont(font)
         editor.setFont(font)
+        # The ink itself is applied in _apply_editor_alignment, which runs
+        # after setPlainText — setting a char format here would be wiped by it.
+        run = para.runs[0] if para.runs else None
+        ink = getattr(run, "color", None) or (0.0, 0.0, 0.0)
+        self._edit_ink = QColor.fromRgbF(
+            *(max(0.0, min(1.0, float(c))) for c in ink[:3]))
         option = QTextOption()
         option.setAlignment(_ALIGN_FLAGS.get(para.align,
                                              Qt.AlignmentFlag.AlignLeft))
@@ -2022,7 +2129,14 @@ class DocView(QWidget):
         editor.document().setDefaultTextOption(option)
 
     def _apply_editor_alignment(self) -> None:
-        """Re-state the alignment on the blocks themselves after setText."""
+        """Re-state alignment and ink on the blocks themselves after setText.
+
+        Both have to happen here rather than in _apply_editor_style, because
+        setPlainText resets block and char formats to the document defaults.
+        The ink cannot go through the palette at all: the global QSS sets
+        `color` on QTextEdit, and QSS beats the palette, so the paragraph
+        would be drawn in the theme's near-white body colour on white paper.
+        """
         editor = self._editor
         para = self._edit_para
         if editor is None or para is None:
@@ -2032,6 +2146,14 @@ class DocView(QWidget):
         cursor.select(QTextCursor.SelectionType.Document)
         editor.setTextCursor(cursor)
         editor.setAlignment(align)
+        ink = getattr(self, "_edit_ink", None)
+        if ink is not None:
+            fmt = QTextCharFormat()
+            fmt.setForeground(ink)
+            cursor.mergeCharFormat(fmt)
+            # So the next keystroke is the paragraph's colour too, not the
+            # document default the theme would otherwise supply.
+            editor.setCurrentCharFormat(fmt)
         cursor.movePosition(QTextCursor.MoveOperation.End)
         editor.setTextCursor(cursor)
 
@@ -2057,3 +2179,127 @@ class DocView(QWidget):
             font.setBold(bool(run.bold))
             font.setItalic(bool(run.italic))
         return font
+
+    # --- editable-paragraph outlines --------------------------------------
+
+    def editable_paragraph_count(self, page: int) -> int | None:
+        """How many paragraphs on *page* Edit Text will take.
+
+        ``None`` means the page has not been scanned yet, which a caller must
+        NOT report as "nothing here" — the scan is idle-batched, so "not yet"
+        and "none at all" arrive milliseconds apart and only one of them is
+        worth telling the user about.
+        """
+        boxes = self._para_boxes.get(int(page))
+        return None if boxes is None else len(boxes)
+
+    def editable_paragraph_boxes(self, page: int) -> list[tuple]:
+        """The displayed-space boxes currently outlined on *page*."""
+        return list(self._para_boxes.get(int(page)) or ())
+
+    def hovered_paragraph(self) -> tuple[int, int] | None:
+        """(page, ordinal within that page's outlines) under the cursor."""
+        return self._para_hover
+
+    def paragraph_scan_stats(self) -> tuple[int, float]:
+        """(pages detected, seconds spent) — what the cache has saved."""
+        return self._para_scans, self._para_scan_secs
+
+    def _invalidate_paragraph_outlines(
+            self, pages: list[int] | None = None) -> None:
+        """Drop cached boxes; ``None`` drops every page."""
+        if pages is None:
+            self._para_boxes.clear()
+            self._para_queue.clear()
+            self._para_timer.stop()
+            self._clear_paragraph_hover()
+            return
+        affected = {int(p) for p in pages}
+        for page in affected:
+            self._para_boxes.pop(page, None)
+        self._para_queue = [p for p in self._para_queue if p not in affected]
+        if self._para_hover is not None and self._para_hover[0] in affected:
+            self._clear_paragraph_hover()
+
+    def _schedule_paragraph_scan(
+            self, vis: tuple[int, int] | None = None) -> None:
+        """Queue the visible pages whose editable paragraphs are unknown."""
+        if self._mode != "text" or self._session is None or not self._geo:
+            return
+        if vis is None:
+            vis = self._visible_range()
+            if vis is None:
+                return
+        # Visible pages only. A whole-document pass would pay a full paragraph
+        # detection per page for outlines nobody is looking at, and on a long
+        # document that is seconds of stalled scrolling.
+        wanted = [p for p in range(vis[0], vis[1] + 1)
+                  if p not in self._para_boxes and p not in self._para_queue]
+        if not wanted:
+            return
+        self._para_queue.extend(wanted)
+        self._para_timer.start()
+
+    def _detect_paragraph_batch(self) -> None:
+        """One idle tick of paragraph detection, off the paint path."""
+        session = self._session
+        if session is None or self._mode != "text" or not self._para_queue:
+            self._para_queue.clear()
+            self._para_timer.stop()
+            return
+        landed: list[tuple[int, int]] = []
+        for _ in range(_PARA_BATCH):
+            if not self._para_queue:
+                break
+            page = self._para_queue.pop(0)
+            if page in self._para_boxes or page >= len(self._geo):
+                continue
+            started = time.perf_counter()
+            try:
+                found = session.paragraphs(page)
+            except EngineError:
+                found = []
+            self._para_scan_secs += time.perf_counter() - started
+            self._para_scans += 1
+            boxes = [tuple(float(v) for v in para.bbox_display)
+                     for para in found if para.reflowable]
+            self._para_boxes[page] = boxes
+            landed.append((page, len(boxes)))
+            self._pages.update(
+                self._geo[page].toRect().adjusted(-2, -2, 2, 2))
+        if not self._para_queue:
+            self._para_timer.stop()
+        # Emitted after the loop: a listener is free to change the mode or
+        # mutate the document, and doing that halfway through a batch would
+        # have the rest of it repopulate a cache that was just cleared.
+        for page, count in landed:
+            self.paragraph_outlines_ready.emit(page, count)
+
+    def _paragraph_box_at(self, pos: QPointF) -> tuple[int, int] | None:
+        page, px, py, inside = self._page_at(pos)
+        if not inside:
+            return None
+        for i, box in enumerate(self._para_boxes.get(page) or ()):
+            if box[0] <= px <= box[2] and box[1] <= py <= box[3]:
+                return page, i
+        return None
+
+    def _update_paragraph_hover(self, pos: QPointF) -> None:
+        """Make the page itself say where editing is possible."""
+        if self._mode != "text" or not self._geo:
+            return
+        hit = self._paragraph_box_at(pos)
+        self._pages.setCursor(Qt.CursorShape.IBeamCursor if hit is not None
+                              else Qt.CursorShape.ArrowCursor)
+        if hit == self._para_hover:
+            return
+        self._para_hover = hit
+        self._pages.update()
+
+    def _clear_paragraph_hover(self) -> None:
+        if self._para_hover is None:
+            return
+        self._para_hover = None
+        if self._mode == "text":
+            self._pages.setCursor(Qt.CursorShape.ArrowCursor)
+        self._pages.update()

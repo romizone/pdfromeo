@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.2.1
+
+Edit Text now looks like editing the page, rather than a dialog dropped on
+top of it.
+
+- **The mode shows you what it can do.** Choosing Edit Text outlines every
+  paragraph it can re-wrap, and the one under the cursor is picked out more
+  strongly. Previously the mode changed nothing on screen and only wrote a
+  line to the status strip, so there was no way to tell an editable
+  paragraph from a scanned one except by trying. Blocks it will not touch —
+  tables, contents pages, rotated text — are deliberately left bare rather
+  than outlined and then refused.
+- **A page with nothing to edit says so**, instead of leaving you
+  double-clicking a scan that will never respond.
+- **The overlay takes the paper's colour and the paragraph's own ink.** It
+  had inherited the dark theme's input styling: a dark rounded field with
+  near-white text on a white page. Its 12 pt padding also shunted the text
+  sideways the moment it opened; the padding is gone, so the words stay
+  exactly where they were and only a hairline marks that typing is live.
+
+Paragraph detection costs 18 ms a page and is deliberately uncached, so the
+outlines are found on an idle timer for visible pages only, never from the
+paint path: a full repaint with outlines drawn takes 1.1 ms, and fifty
+scroll steps trigger no detection at all. Outline geometry is used for
+drawing and hit-testing only — which paragraph an edit actually lands on is
+still resolved from the document each time, because committing an edit
+renumbers the page's paragraphs.
+
+`tests/test_edit_text_ui.py` adds 39 checks.
+
 ## 2.2.0
 
 The paragraph you edit can now grow. When a re-wrapped paragraph needs more

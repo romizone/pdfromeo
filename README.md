@@ -31,7 +31,7 @@ native-feeling desktop app. Built with PySide6,
 - **Tools pane** — reach all 43 batch tools without leaving the document
 
 ### ✍️ Edit text with reflow
-- **Double-click a paragraph and retype it** — the whole paragraph re-wraps
+- **Choose Edit Text and every editable paragraph is outlined** — double-click one and retype it; the whole paragraph re-wraps
 - Keeps the document's **own font**, its justification, and inline bold/italic
 - **Content below moves to make room** when the paragraph grows, and closes
   back up when it shrinks — including bullets, tables, images, links, form
@@ -248,6 +248,7 @@ PdfRomeo/
     ├── regression.py        # one check per historical bug
     ├── test_session.py      # DocumentSession (annots, undo, search…)
     ├── test_reflow.py       # paragraph reflow (metrics, wrap, emit)
+    ├── test_edit_text_ui.py # Edit Text outlines, hover, hints
     ├── smoke_workspace.py   # the v2 workspace end to end
     └── smoke_ui.py          # UI / 43 tool panels / home
 ```
@@ -273,6 +274,9 @@ PYTHONPATH=. python tests/test_session.py
 
 # Paragraph reflow — measurement, detection, re-wrapping, safety gate
 PYTHONPATH=. python tests/test_reflow.py
+
+# Edit Text affordances — outlines, hover, status hints (headless)
+QT_QPA_PLATFORM=offscreen PYTHONPATH=. python tests/test_edit_text_ui.py
 
 # Workspace — viewer, panels, commenting, page ops (headless)
 QT_QPA_PLATFORM=offscreen PYTHONPATH=. python tests/smoke_workspace.py
